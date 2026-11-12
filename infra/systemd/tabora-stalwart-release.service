@@ -1,0 +1,33 @@
+# Раз в неделю: есть ли новая версия Stalwart (сам он не обновляется: версия и sha256 закреплены
+# в infra/setup.sh). Если есть — предупреждение в журнал и при входе по SSH (motd).
+[Unit]
+Description=Tabora: check for a new Stalwart release
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+StateDirectory=tabora-release
+ExecStart=/usr/local/lib/tabora/stalwart/check-release.sh
+CapabilityBoundingSet=
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service

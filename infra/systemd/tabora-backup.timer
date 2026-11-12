@@ -1,0 +1,11 @@
+[Unit]
+Description=Tabora: daily backup
+
+[Timer]
+# до окна перезагрузки после автообновлений (04:30)
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=20m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

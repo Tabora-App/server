@@ -1,0 +1,9 @@
+; Записи tabora.app, которых нет в зоне Stalwart: подтверждения владения доменом и подобное.
+; Публикует их cloudflare/dns.sh вместе с почтовыми. Значения здесь не секретны: они видны в DNS.
+
+; Веб-версия: тот же сервер, что почтовый хост, напрямую (без Cloudflare Tunnel), серое облако.
+; nginx: infra/nginx/app.conf; сертификат выпускает infra/enable-tls.sh.
+app.tabora.app. IN CNAME mx.tabora.app.
+
+; Google: подтверждение владения доменом (добавлено 11 ноября 2026)
+tabora.app. IN TXT "google-site-verification=r-AdBqqC_oQMgWpKhR1yZGHYZlFiRjw5cETqUtTXcxg"

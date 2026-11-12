@@ -1,0 +1,11 @@
+[Unit]
+Description=Tabora: verify the backup repository (restic check)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/tabora/backup/check.sh
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=12h

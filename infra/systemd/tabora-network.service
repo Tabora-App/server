@@ -1,0 +1,14 @@
+# При загрузке сверяет netplan с метаданными Hetzner (infra/network/netplan.py). На своей машине
+# ничего не меняет; на машине, развёрнутой из снапшота, дописывает её MAC и IPv6. IPv4 и вход по
+# SSH от этой службы не зависят: DHCP на любом интерфейсе задан в самом netplan.
+[Unit]
+Description=Tabora: netplan follows the machine (IPv6 from Hetzner metadata)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/tabora/network/netplan.py boot
+
+[Install]
+WantedBy=multi-user.target

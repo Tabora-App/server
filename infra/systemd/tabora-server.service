@@ -1,0 +1,49 @@
+# Сервер аккаунтов и синхронизации Tabora (ставит infra/setup.sh). Пока бинарника нет, служба
+# пропускается при загрузке (ConditionFileIsExecutable), а не падает.
+[Unit]
+Description=Tabora account and sync server
+After=network-online.target postgresql.service stalwart.service
+Wants=network-online.target
+ConditionFileIsExecutable=/opt/tabora/bin/tabora-server
+
+[Service]
+Type=simple
+User=tabora
+Group=tabora
+EnvironmentFile=/etc/tabora/server.env
+ExecStart=/opt/tabora/bin/tabora-server
+Restart=on-failure
+RestartSec=3
+
+# слушает 127.0.0.1:7700 (выше 1024), ходит в PostgreSQL и Stalwart по TCP: возможности не нужны
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/tabora/data
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

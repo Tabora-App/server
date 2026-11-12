@@ -1,0 +1,12 @@
+# Ежедневная резервная копия (infra/backup/backup.sh). Останавливает Stalwart на несколько секунд.
+[Unit]
+Description=Tabora: backup (restic)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/tabora/backup/backup.sh
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=6h

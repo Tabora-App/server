@@ -1,0 +1,54 @@
+# fail2ban для Tabora (/etc/fail2ban/jail.d/tabora.local, ставит infra/setup.sh).
+# backend задаётся в каждой тюрьме: ssh и Stalwart пишут в journald, nginx — в файлы.
+#
+# Правила, которые здесь выдерживаются:
+#  - владелец входит по SSH с динамического адреса, поэтому порт 22 закрывает только тюрьма sshd
+#    (ненадолго); recidive и остальные тюрьмы банят почтовые и веб-порты, но не 22;
+#  - одна серия ошибок считается одной тюрьмой: HTTP/JMAP — tabora-jmap (журнал nginx),
+#    SMTP AUTH и IMAP — stalwart (журнал Stalwart, события HTTP-слушателя исключены);
+#  - в ignoreip только loopback.
+[DEFAULT]
+bantime = 1h
+findtime = 10m
+maxretry = 5
+ignoreip = 127.0.0.1/8 ::1
+banaction = nftables
+banaction_allports = nftables[type=allports]
+
+# вход только по ключу, подбирать нечего: бан короткий, чтобы владелец не запер себя надолго
+[sshd]
+enabled = true
+backend = systemd
+maxretry = 10
+bantime = 10m
+
+[nginx-botsearch]
+enabled = true
+backend = auto
+port = https
+logpath = /var/log/nginx/access.log
+          /var/log/nginx/mx.access.log
+
+# JMAP почтового хоста: 401/403 на запрос с заголовком Authorization (подбор паролей, вход
+# администратором снаружи). 401 без заголовка — обычный первый запрос клиента, не считается.
+[tabora-jmap]
+enabled = true
+backend = auto
+filter = tabora-jmap
+port = https
+logpath = /var/log/nginx/mx.access.log
+maxretry = 10
+
+# неудачный вход в Stalwart по SMTP AUTH (465/587) и IMAP (993); адрес из журнала Stalwart
+[stalwart]
+enabled = true
+backend = systemd
+filter = stalwart
+journalmatch = _SYSTEMD_UNIT=stalwart.service
+port = smtp,submission,submissions,imaps
+
+# повторные баны: неделя, но только почта и веб — SSH остаётся доступен
+[recidive]
+enabled = true
+banaction = nftables
+port = smtp,submission,submissions,imaps,https

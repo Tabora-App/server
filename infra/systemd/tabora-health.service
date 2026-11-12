@@ -1,0 +1,21 @@
+# Проверка состояния сервера (infra/monitor/health.py): службы, место, сертификаты, копии,
+# признаки утечки секрета администратора. Результат: journald, /run/tabora/health.json, motd.
+[Unit]
+Description=Tabora: health check
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/tabora/monitor/health.py run
+RuntimeDirectory=tabora
+RuntimeDirectoryPreserve=yes
+SyslogIdentifier=tabora-health
+TimeoutStartSec=5min
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+LockPersonality=true

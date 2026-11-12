@@ -1,0 +1,47 @@
+# Cloudflare Tunnel: tabora.app, www, api → nginx 127.0.0.1:8081 (ставит cloudflare/setup-tunnel.sh).
+# Своя служба вместо `cloudflared service install`: отдельный динамический пользователь, учётные
+# данные туннеля (root, 600) передаются через LoadCredential, файловая система только для чтения.
+# Обновляется пакетом через unattended-upgrades; самообновление отключено (--no-autoupdate).
+[Unit]
+Description=Cloudflare Tunnel for __DOMAIN__
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+DynamicUser=yes
+LoadCredential=tunnel.json:/etc/cloudflared/__TUNNEL_ID__.json
+ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel --credentials-file %d/tunnel.json run __TUNNEL_ID__
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=60
+
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

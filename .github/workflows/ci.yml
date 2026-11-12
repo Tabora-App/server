@@ -1,0 +1,29 @@
+name: CI
+
+# Builds the server, runs its unit tests and checks that every message has its translations.
+# The Rust toolchain is the one pinned in rust-toolchain.toml.
+# Third-party actions are pinned to a full commit SHA (the tag is in the comment).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup show
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --locked
+      - name: Translations
+        run: node tools/i18n.mjs check --strict

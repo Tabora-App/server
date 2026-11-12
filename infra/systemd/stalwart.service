@@ -1,0 +1,51 @@
+# Stalwart Mail Server (ставит infra/setup.sh). Ограничения проверены: служба стартует, принимает
+# SMTP/IMAP/JMAP, пишет только в data и logs; `systemd-analyze security stalwart`.
+[Unit]
+Description=Stalwart Mail Server
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/stalwart/etc/config.json
+
+[Service]
+Type=notify
+User=stalwart
+Group=stalwart
+EnvironmentFile=/opt/stalwart/etc/stalwart.env
+ExecStart=/opt/stalwart/bin/stalwart --config=/opt/stalwart/etc/config.json
+SyslogIdentifier=stalwart
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=60
+LimitNOFILE=65536
+
+# привилегированные порты 25/465/587/993 — единственная нужная возможность
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+# файловая система только для чтения, кроме данных и журналов; etc и бинарник принадлежат root
+ProtectSystem=strict
+ReadWritePaths=/opt/stalwart/data /opt/stalwart/logs
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

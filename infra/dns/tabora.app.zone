@@ -1,0 +1,19 @@
+v1-ed25519-20261109._domainkey.tabora.app. IN TXT "v=DKIM1; k=ed25519; h=sha256; p=CNqsph7fVx62AbHajzQwPF5tDSL/N/EIu/pclR+wUFk="
+v1-rsa-20261109._domainkey.tabora.app. IN TXT (
+    "v=DKIM1; k=rsa; h=sha256; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAt/3+hBz58XuJz3PHXuOV8QN3+vYwfLs5khYaVWUjM8sWZoLMp3gUK2w85jlifEG3XL/Mqu3iSugSyATTvLjpJaH4YCt7bMpoYd5WD/4qLR92QqhBSLwEuMf2XLnkMpwnm/A3FwAy9ePjwsBeeeUj3vA5wX+E7FK0wyh/KQR6mrg3i6dTlsdP4zG"
+    "Elrwu9vlBugU+PsmGmkrP/RSykc5kJ60QacNEsZu+mJB4J0i/2N6hz7QuBdF9N+I1orY/LlSLxUICkxxeE+NA7augMuQhwgK/GtUEdNFrfSq4KiojXc3U7oGwXSWfJiNKikMaPDxlybYQkSukpQmRhtPIdwadZwIDAQAB"
+)
+mx.tabora.app. IN TXT "v=spf1 a -all"
+tabora.app. IN TXT "v=spf1 mx -all"
+tabora.app. IN MX 10 mx.tabora.app.
+_dmarc.tabora.app. IN TXT "v=DMARC1; p=reject; rua=mailto:postmaster@tabora.app"
+_jmap._tcp.tabora.app. IN SRV 0 1 443 mx.tabora.app.
+_imaps._tcp.tabora.app. IN SRV 0 1 993 mx.tabora.app.
+_submissions._tcp.tabora.app. IN SRV 0 1 465 mx.tabora.app.
+mta-sts.tabora.app. IN CNAME mx.tabora.app.
+_mta-sts.tabora.app. IN TXT "v=STSv1; id=6897568975574718513"
+_smtp._tls.tabora.app. IN TXT "v=TLSRPTv1; rua=mailto:postmaster@tabora.app"
+ua-auto-config.tabora.app. IN CNAME mx.tabora.app.
+_ua-auto-config.tabora.app. IN TXT "v=UAAC1; a=sha256; d=1BUcFCRvQ1Whun4u9Emk+doIgTP0HywyqGNZa8vJ2Qk="
+autoconfig.tabora.app. IN CNAME mx.tabora.app.
+autodiscover.tabora.app. IN CNAME mx.tabora.app.

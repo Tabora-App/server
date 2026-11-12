@@ -1,0 +1,10 @@
+[Unit]
+Description=Tabora: weekly check for a new Stalwart release
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
