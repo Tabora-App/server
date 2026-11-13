@@ -41,6 +41,9 @@ server, backups, monitoring) is in [`infra/`](infra/README.md).
 - Support tickets, on the contrary, are stored in the clear: support staff read the conversation
   and the attachments, and there is no end-to-end encryption here. A ticket is visible only to its
   author and to support staff.
+- A ticket from someone without an account (the support site) is known by the e-mail address its
+  author gave. Support does not see it, and no letter with the author's words is sent anywhere,
+  until that address is confirmed with a link from a letter.
 
 ## API
 
@@ -63,6 +66,7 @@ The account contract is defined by the browser:
 | `GET /v1/mail/jmap/download/:account/:blob/:name?accept=type` | the content of an attachment or a message: `Content-Disposition: attachment`, `nosniff`, no caching |
 | `POST /v1/mail/jmap/upload/:account` | upload an attachment or a raw message (up to 52 MiB): `{ accountId, blobId, type, size }` |
 | `GET /v1/account/devices` (Bearer) | `[{ id, name, at, current, active }]` — `active`: the device has a live session |
+| `POST /v1/account/login { …, scope: "support" }` | a sign-in of the support site: the session reaches only `/v1/support/…` and `/v1/account/logout`, every other request answers `403 session-scope`; no mail access is issued (`mail: null`). An unknown `scope` — `400` |
 | `POST /v1/account/devices/:id/revoke { loginHash }` | another device's session is ended: its sessions are deleted, its mail app password is revoked, the device is removed from the list; own device — `400`, unknown device — `404 not-found` |
 | `POST /v1/pair/start` (Bearer) | start a sign-in on another device by QR code: `{ id, expiresAt }`; an exchange lives three minutes, an account has at most three pending ones |
 | `POST /v1/pair/join { id, public, claim, deviceId, deviceName }` | the new device has scanned the code: its one-time public key and the SHA-256 of the secret with which it will collect the result; joining is possible once, otherwise `404 pair-gone` |
@@ -96,6 +100,11 @@ The account contract is defined by the browser:
 | `POST /v1/support/tickets/:id/status { status: "closed" \| "open" }` | the whole ticket |
 | `GET /v1/support/files/:id` | the attachment bytes: the attachment's `Content-Type`, `Content-Disposition: attachment`, `nosniff`, `Cache-Control: private, max-age=3600` |
 | `GET /v1/support/unread` | `{ count, staff, queue? }` — the user's own tickets with an unread reply; `queue` (for staff) — everyone's tickets with status `open` |
+| `POST /v1/support/guest { email, subject, text, lang? }` (no session) | a ticket from someone without an account: `{ sent: true }`, and a letter with a link goes to `email`. The ticket waits for the link to be opened; an address in the server's own domain — `400 support-invalid` |
+| `POST /v1/support/guest/open { key }` | the ticket by the key of its link (`<number>.<secret>`), as its author sees it, plus `guest: true` and `email`. The first opening confirms the address: support now sees the ticket and gets its e-mail. A wrong number or secret — `404 not-found` |
+| `POST /v1/support/guest/messages { key, text }` | the author's new message (text only); the whole ticket |
+| `POST /v1/support/guest/status { key, status: "closed" \| "open" }` | the whole ticket |
+| `POST /v1/support/guest/file { key, id }` | the bytes of an attachment of this ticket (attachments come only from support) |
 
 In the sign-in settings requests, `loginHash` is a repeated password check; `code` is the second
 factor and is required when protection is on.
@@ -165,7 +174,20 @@ and by posting one's own message. E-mails: about a new ticket and about the user
 `TABORA_SUPPORT_NOTIFY`; about a reply from support — to the author, at the address of their
 account. E-mails are sent in the background, and a mail failure cancels nothing.
 
-Support settings: `TABORA_SUPPORT_STAFF` — comma-separated addresses of staff accounts
+Tickets without an account. The support site (`TABORA_SUPPORT_URL`) lets a person who cannot sign
+in, or has no account yet, leave an e-mail address. `POST /v1/support/guest` stores the ticket and
+sends a letter with a link `<site>/#t=<number>.<secret>` to that address — in the language given in
+`lang` (`ru`, `en`, `uk`, `es`), with a fixed text and nothing of what the author wrote, so the form
+cannot be used to send someone a text of the sender's choosing. Until the link is opened the ticket
+does not exist for support: it is not in the queue, staff get `404` for it and no e-mail about it.
+Opening the link confirms the address. The secret is 24 random bytes; it is the only key to the
+ticket, the page keeps it after `#` (a browser does not send that part to a server), and a wrong
+number and a wrong secret are answered alike. Support's replies go to the same address with the same
+link. In staff responses such a ticket has `guest: true` and the address as `author`. A ticket whose
+link nobody opened in two days is deleted by the hourly cleanup.
+
+Support settings: `TABORA_SUPPORT_URL` — the address of the support site that letters link to
+(`https://support.<domain>` by default). `TABORA_SUPPORT_STAFF` — comma-separated addresses of staff accounts
 (case-insensitive; empty — no staff), `TABORA_SUPPORT_NOTIFY` — the address for e-mails about new
 tickets and user replies (empty — no such e-mails are sent). The staff list must contain only
 addresses of accounts that already exist: whoever owns the account with such an address becomes
@@ -189,6 +211,14 @@ is historical). Tests: `tests/sessions.mjs` — a session "400 days old", sign-o
 not touch other devices, a server restart does not lose sessions.
 
 Sessions are stored in the database: losing the database without a backup signs everyone out.
+
+A session may be made for one purpose (`sessions.scope`). An ordinary session has an empty scope
+and reaches everything. A sign-in with `scope: "support"` — the support site — gets a session that
+is accepted only by the support requests and by sign-out; the mail, the keys, the devices, the
+sign-in settings and sync answer it `403 session-scope`. So the token the support site keeps in a
+browser opens tickets and nothing else. Such a sign-in passes the same password and second-step
+checks, appears in the list of devices and is ended from there like any other. Tests:
+`tests/contract.mjs`.
 
 ### Language of responses and e-mails
 
@@ -215,7 +245,7 @@ Codes: `bad-credentials`, `session-expired`, `rate-limited`, `taken`, `bad-nonce
 `no-recovery`, `mail-unavailable`, `signup-closed`, `signup-paused`, `alias-limit`, `old-client`,
 `2fa-required`, `bad-2fa`, `2fa-on`, `2fa-off`, `2fa-setup-expired`, `bad-address`, `same-address`,
 `bad-code`, `no-code`, `sync-invalid`, `sync-limit`, `sync-key`, `sync-reset`, `mail-forbidden`, `support-invalid`,
-`support-limit`, `not-found`.
+`support-limit`, `session-scope`, `not-found`.
 
 ## Limits
 
@@ -269,6 +299,12 @@ ticket and 60 messages an hour from a user (`429 support-limit`). E-mails to sup
 separately — twelve an hour caused by one user, and half of the server's daily e-mail limit for
 everyone: tickets cannot use up the reserve from which password reset codes are sent. A message is
 saved even when the e-mail about it was not sent.
+
+Tickets without an account: three new ones an hour and six a day from one network address, 240
+calls an hour from it to all the guest requests; for one e-mail address — at most two tickets
+waiting for confirmation and three new ones a day, from whatever network addresses they come
+(every one is a letter to that address); letters with links — a quarter of the server's daily
+e-mail limit; 20 messages an hour in one ticket (`429 support-limit`).
 
 ## Build, test, deploy
 

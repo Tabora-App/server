@@ -6,6 +6,8 @@ LIB=/usr/local/lib/tabora        # копия infra/ на сервере: её �
 MX_LIVE=/etc/letsencrypt/live/$MAIL_HOST
 APP_HOST=${APP_HOST:-app.$DOMAIN}   # веб-версия (nginx/app.conf)
 APP_LIVE=/etc/letsencrypt/live/$APP_HOST
+SUPPORT_HOST=${SUPPORT_HOST:-support.$DOMAIN}   # the support site (nginx/support.conf)
+SUPPORT_LIVE=/etc/letsencrypt/live/$SUPPORT_HOST
 
 log() { printf '\033[1;32m›\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
@@ -28,6 +30,7 @@ install_lib() {
 
 tls_enabled() { [ -f "$MX_LIVE/fullchain.pem" ] && [ -f "$MX_LIVE/privkey.pem" ]; }
 app_tls_enabled() { [ -f "$APP_LIVE/fullchain.pem" ] && [ -f "$APP_LIVE/privkey.pem" ]; }
+support_tls_enabled() { [ -f "$SUPPORT_LIVE/fullchain.pem" ] && [ -f "$SUPPORT_LIVE/privkey.pem" ]; }
 
 # Конфигурация nginx одна и та же до и после TLS: сайт и API на 127.0.0.1:8081 (только для туннеля),
 # публично только 443; почтовый хост включается, когда есть сертификат. Порт 80 не слушается вовсе:
@@ -71,6 +74,14 @@ install_nginx() {
     ln -sfn /etc/nginx/sites-available/tabora-app /etc/nginx/sites-enabled/tabora-app
   else
     rm -f /etc/nginx/sites-enabled/tabora-app /etc/nginx/sites-available/tabora-app
+  fi
+  # the support site: its name is enabled once its certificate is issued (enable-tls.sh)
+  install -d -m 755 -o root -g root "/var/www/$SUPPORT_HOST"
+  if support_tls_enabled; then
+    render "$src/support.conf" /etc/nginx/sites-available/tabora-support
+    ln -sfn /etc/nginx/sites-available/tabora-support /etc/nginx/sites-enabled/tabora-support
+  else
+    rm -f /etc/nginx/sites-enabled/tabora-support /etc/nginx/sites-available/tabora-support
   fi
   nginx -t -q
   systemctl enable nginx >/dev/null 2>&1

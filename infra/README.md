@@ -21,6 +21,14 @@ PostgreSQL).
   `tools/web/test/headers.test.mjs` there compares the two. Bringing it into service:
   `deploy.sh tls` (certificate for the name), `deploy.sh dns` (CNAME `app` → `mx`), then
   `tools/deploy.sh web` in the Tabora-App/browser repository.
+- The support site `support.tabora.app` (`nginx/support.conf`) is served the same way: directly on
+  port 443, with its own Let's Encrypt certificate. Static files are in
+  `/var/www/support.tabora.app` (built by `tools/web/build-support.mjs` in the browser repository);
+  of the account server only the sign-in and the support requests are reachable through this name
+  (`/v1/account/prelogin|login|logout`, `/v1/support/…`), everything else answers `404`. Bringing
+  it into service: `deploy.sh tls` (certificate), `deploy.sh nginx`, `deploy.sh dns` (CNAME
+  `support` → the mail host, `dns/extra.zone`), `deploy.sh server` (the account server must know
+  the support sign-in), then `tools/deploy.sh support` from the browser repository.
 - nginx serves nothing for the bare IP and for foreign names (443 — the TLS handshake is refused,
   8081 — `444`).
 - Stalwart HTTP/JMAP listens only on `127.0.0.1:8080`; it takes the client address from

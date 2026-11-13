@@ -20,10 +20,23 @@
 //! Письма: о новом обращении и о каждом ответе пользователя — на `TABORA_SUPPORT_NOTIFY`, об
 //! ответе поддержки — пользователю на адрес его аккаунта. Письма уходят в фоне: сбой почты не
 //! отменяет ни обращение, ни сообщение.
+//!
+//! Where requests are written. In the browser (Settings -> Support) and on the support site
+//! (`TABORA_SUPPORT_URL`). The site signs in with a session of the scope "support": it reaches
+//! these requests and nothing else of the account (`App::auth_for`).
+//!
+//! Requests without an account (the support site, `/v1/support/guest…`). Someone who cannot sign
+//! in, or has no account yet, leaves an e-mail address. The request is not shown to support
+//! until the address is confirmed: a letter with a link goes to it, and opening the link confirms
+//! the address. The letter has a fixed text and never carries what the author wrote, so the form
+//! cannot be used to send someone a text of the sender's choosing. The link holds the request's
+//! number and a secret; whoever has it reads the request and answers in it, and support's answers
+//! come to the same address with the same link. A request whose link nobody opened in two days
+//! is deleted. Attachments are not accepted from authors without an account.
 
-use crate::api::{bad, err, sized, wait_text, ApiError, ApiResult, App};
+use crate::api::{bad, client_ip, err, sized, wait_text, ApiError, ApiResult, App};
 use crate::db::{self, Ticket, TicketSummary, User};
-use crate::util::{iso, now_ms};
+use crate::util::{clean_address, iso, now_ms, random, same};
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{Path, Query, State};
@@ -57,6 +70,16 @@ const NOTIFY_PER_USER_HOUR: u32 = 12;
 /// Допустимые вложения: тип и расширение для имени по умолчанию.
 const TYPES: [(&str, &str); 4] = [("image/png", "png"), ("image/jpeg", "jpg"), ("image/webp", "webp"), ("text/plain", "txt")];
 const STATUSES: [&str; 3] = ["open", "answered", "closed"];
+/// Requests without an account. From one network address: new requests an hour and a day, and
+/// any calls an hour. For one e-mail address: requests waiting for confirmation and new requests
+/// a day (each one is a letter to that address). On the whole server: letters with links a day.
+const GUEST_PER_IP_HOUR: u32 = 3;
+const GUEST_PER_IP_DAY: u32 = 6;
+const GUEST_CALLS_PER_IP_HOUR: u32 = 240;
+const GUEST_PENDING_PER_ADDRESS: i64 = 2;
+const GUEST_PER_ADDRESS_DAY: i64 = 3;
+const GUEST_MESSAGES_PER_HOUR: u32 = 20;
+const GUEST_KEY_BYTES: usize = 24;
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
 fn invalid(message: impl Into<String>) -> ApiError {
@@ -92,9 +115,10 @@ fn is_staff(app: &App, user: &User) -> bool {
 /// Кем смотрящий приходится обращению: Some(true) — поддержка, Some(false) — автор, None —
 /// посторонний. Сотрудник в своём собственном обращении — автор.
 fn role(app: &App, user: &User, t: &Ticket) -> Option<bool> {
-    if t.user_id == user.id {
+    if t.user_id == Some(user.id) {
         Some(false)
-    } else if is_staff(app, user) {
+    } else if is_staff(app, user) && (!t.is_guest() || t.guest_confirmed) {
+        // a request without an account does not exist for support until its address is confirmed
         Some(true)
     } else {
         None
@@ -254,10 +278,11 @@ fn mail_later(app: &Arc<App>, to: String, subject: String, text: String, ticket:
 
 /// Письмо поддержке о новом обращении или об ответе пользователя. У этих писем свои пределы:
 /// они не должны выбрать суточный запас писем сервера, из которого уходят коды сброса пароля.
-fn notify_staff(app: &Arc<App>, user: &User, ticket: i64, subject: String, text: String) {
+/// `author` names whose letters are counted together: an account or a request without an account.
+fn notify_staff(app: &Arc<App>, author: &str, ticket: i64, subject: String, text: String) {
     let Some(to) = app.support_notify.clone() else { return };
     let now = now_ms();
-    let per_user = app.limiter.hit(&format!("support-mail:{}", user.id), NOTIFY_PER_USER_HOUR, 3_600_000, now);
+    let per_user = app.limiter.hit(&format!("support-mail:{author}"), NOTIFY_PER_USER_HOUR, 3_600_000, now);
     if per_user.is_err() || app.limiter.hit("support-mail", (app.mail_daily_cap / 2).max(1), 86_400_000, now).is_err() {
         return;
     }
@@ -279,6 +304,9 @@ fn summary_json(s: &TicketSummary, with_author: bool) -> Value {
     });
     if with_author {
         v["author"] = json!(t.author);
+        if t.is_guest() {
+            v["guest"] = json!(true);
+        }
     }
     v
 }
@@ -306,6 +334,9 @@ async fn ticket_json<C: GenericClient>(c: &C, t: &Ticket, as_staff: bool) -> Res
     });
     if as_staff {
         v["author"] = json!(t.author);
+        if t.is_guest() {
+            v["guest"] = json!(true);
+        }
         if let Some(meta) = t.meta.as_deref().and_then(|m| serde_json::from_str::<Value>(m).ok()) {
             v["meta"] = meta;
         }
@@ -329,7 +360,7 @@ pub struct ListQuery {
 
 /// Список обращений: свои, а для сотрудника с `scope=all` — всех пользователей.
 pub async fn list(State(app): State<Arc<App>>, headers: HeaderMap, Query(q): Query<ListQuery>) -> ApiResult {
-    let (user, _, _) = app.auth(&headers).await?;
+    let (user, _, _) = app.auth_for(&headers, "support").await?;
     app.window(&format!("support:{}", user.id), 1200, 3_600_000)?;
     let staff = is_staff(&app, &user);
     let all = match q.scope.as_deref().unwrap_or("mine") {
@@ -359,7 +390,7 @@ pub struct TicketBody {
 
 /// Новое обращение с первым сообщением.
 pub async fn create(State(app): State<Arc<App>>, headers: HeaderMap, body: Result<Bytes, BytesRejection>) -> ApiResult {
-    let (user, _, _) = app.auth(&headers).await?;
+    let (user, _, _) = app.auth_for(&headers, "support").await?;
     app.window(&format!("support-write:{}", user.id), 240, 3_600_000)?;
     let body = sized(body, too_large)?;
     let b: TicketBody = parse(&body)?;
@@ -379,21 +410,21 @@ pub async fn create(State(app): State<Arc<App>>, headers: HeaderMap, body: Resul
         return Err(limit("За сутки создано слишком много обращений. Напишите в одно из уже открытых или попробуйте завтра"));
     }
     let id = db::insert_ticket(&tx, user.id, &subject, meta.as_deref(), now).await?;
-    let message = db::insert_ticket_message(&tx, id, false, user.id, &text, now).await?;
+    let message = db::insert_ticket_message(&tx, id, false, Some(user.id), &text, now).await?;
     for f in &files {
         db::insert_ticket_file(&tx, message, id, &f.name, f.mime, &f.data).await?;
     }
     tx.commit().await?;
     let out = fresh(&c, id, false).await?;
     drop(c);
-    let note = format!("Автор: {}\nТема: {subject}\nВложений: {}\n\n{}\n\nОтветить можно в браузере: Настройки → Поддержка", user.email, files.len(), excerpt(&text, 600));
-    notify_staff(&app, &user, id, format!("Новое обращение № {id}: {subject}"), note);
+    let note = format!("Автор: {}\nТема: {subject}\nВложений: {}\n\n{}\n\nОтветить можно в браузере (Настройки → Поддержка) или на сайте {}", user.email, files.len(), excerpt(&text, 600), app.support_url);
+    notify_staff(&app, &format!("u{}", user.id), id, format!("Новое обращение № {id}: {subject}"), note);
     Ok(out)
 }
 
 /// Обращение с перепиской. Чтение отмечает его прочитанным для смотрящей стороны.
 pub async fn ticket(State(app): State<Arc<App>>, headers: HeaderMap, Path(id): Path<String>) -> ApiResult {
-    let (user, _, _) = app.auth(&headers).await?;
+    let (user, _, _) = app.auth_for(&headers, "support").await?;
     app.window(&format!("support:{}", user.id), 1200, 3_600_000)?;
     let id = number(&id).ok_or_else(no_ticket)?;
     let c = app.pool.get().await?;
@@ -413,7 +444,7 @@ pub struct MessageBody {
 /// Новое сообщение в обращении: от автора — обращение снова ждёт поддержку, от поддержки —
 /// считается отвеченным, а автору уходит письмо.
 pub async fn reply(State(app): State<Arc<App>>, headers: HeaderMap, Path(id): Path<String>, body: Result<Bytes, BytesRejection>) -> ApiResult {
-    let (user, _, _) = app.auth(&headers).await?;
+    let (user, _, _) = app.auth_for(&headers, "support").await?;
     app.window(&format!("support-write:{}", user.id), 240, 3_600_000)?;
     let id = number(&id).ok_or_else(no_ticket)?;
     let body = sized(body, too_large)?;
@@ -437,7 +468,7 @@ pub async fn reply(State(app): State<Arc<App>>, headers: HeaderMap, Path(id): Pa
     // сообщение всегда новее отметок прочтения, поставленных до него: иначе ответ, пришедший
     // в ту же миллисекунду, что и чтение, остался бы «прочитанным»
     let at = now.max(t.updated_at + 1).max(t.user_read_at + 1).max(t.staff_read_at + 1);
-    let message = db::insert_ticket_message(&tx, id, as_staff, user.id, &text, at).await?;
+    let message = db::insert_ticket_message(&tx, id, as_staff, Some(user.id), &text, at).await?;
     for f in &files {
         db::insert_ticket_file(&tx, message, id, &f.name, f.mime, &f.data).await?;
     }
@@ -446,17 +477,45 @@ pub async fn reply(State(app): State<Arc<App>>, headers: HeaderMap, Path(id): Pa
     let out = fresh(&c, id, as_staff).await?;
     drop(c);
     if as_staff {
-        let letter = format!(
-            "{}\n\n—\nОбращение № {id}: {}\nОтветить можно в браузере: Настройки → Поддержка\n\nПисьмо отправлено автоматически, отвечать на него не нужно.",
-            excerpt(&text, 4000),
-            t.subject
-        );
-        mail_later(&app, t.author.clone(), format!("Ответ поддержки Tabora: {}", t.subject), letter, id);
+        answer_letter(&app, &t, &text);
     } else {
-        let note = format!("Автор: {}\nТема: {}\nВложений: {}\n\n{}\n\nОтветить можно в браузере: Настройки → Поддержка", user.email, t.subject, files.len(), excerpt(&text, 600));
-        notify_staff(&app, &user, id, format!("Ответ в обращении № {id}: {}", t.subject), note);
+        let note = format!("Автор: {}\nТема: {}\nВложений: {}\n\n{}\n\nОтветить можно в браузере (Настройки → Поддержка) или на сайте {}", user.email, t.subject, files.len(), excerpt(&text, 600), app.support_url);
+        notify_staff(&app, &format!("u{}", user.id), id, format!("Ответ в обращении № {id}: {}", t.subject), note);
     }
     Ok(out)
+}
+
+/// The letter to the author about support's answer. An account gets it in its mailbox; an author
+/// without an account gets it at the address of the request, with the request's link and in the
+/// language the request was written in.
+fn answer_letter(app: &Arc<App>, t: &Ticket, text: &str) {
+    let id = t.id;
+    let subject = format!("Ответ поддержки Tabora: {}", t.subject);
+    match t.guest_key.as_deref().filter(|_| t.is_guest()) {
+        None => {
+            let letter = format!(
+                "{}\n\n—\nОбращение № {id}: {}\nОтветить можно в браузере (Настройки → Поддержка) или на сайте {}\n\nПисьмо отправлено автоматически, отвечать на него не нужно.",
+                excerpt(text, 4000),
+                t.subject,
+                app.support_url
+            );
+            mail_later(app, t.author.clone(), subject, letter, id);
+        }
+        Some(key) => {
+            let letter = format!(
+                "{}\n\n—\nОбращение № {id}: {}\nОтветить можно по ссылке: {}\n\nПисьмо отправлено автоматически, отвечать на него не нужно.",
+                excerpt(text, 4000),
+                t.subject,
+                guest_link(app, id, key)
+            );
+            let (app, to, lang) = (app.clone(), t.author.clone(), t.guest_lang.clone());
+            tokio::spawn(async move {
+                if let Err(e) = app.send_mail_in(&to, &subject, &letter, lang.as_deref()).await {
+                    eprintln!("поддержка: письмо об обращении № {id} не отправлено: {}", e.code);
+                }
+            });
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -466,7 +525,7 @@ pub struct StatusBody {
 
 /// Закрыть обращение или открыть его снова: может и автор, и поддержка.
 pub async fn set_status(State(app): State<Arc<App>>, headers: HeaderMap, Path(id): Path<String>, body: Bytes) -> ApiResult {
-    let (user, _, _) = app.auth(&headers).await?;
+    let (user, _, _) = app.auth_for(&headers, "support").await?;
     app.window(&format!("support-write:{}", user.id), 240, 3_600_000)?;
     let id = number(&id).ok_or_else(no_ticket)?;
     let b: StatusBody = parse(&body)?;
@@ -484,28 +543,33 @@ pub async fn set_status(State(app): State<Arc<App>>, headers: HeaderMap, Path(id
     fresh(&c, id, as_staff).await
 }
 
+/// An attachment as a reply: its own type, offered only as a file to save, never to be guessed.
+fn file_response(name: &str, mime: String, data: Vec<u8>) -> Response {
+    let head = [
+        (CONTENT_TYPE, mime),
+        (CONTENT_DISPOSITION, format!("attachment; filename*=UTF-8''{}", encode_name(name))),
+        (X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+        (CACHE_CONTROL, "private, max-age=3600".to_string()),
+    ];
+    (head, data).into_response()
+}
+
 /// Вложение: байты с исходным типом. Отдаётся только как файл для сохранения, тип браузеру
 /// угадывать запрещено; доступ — как к самому обращению.
 pub async fn file(State(app): State<Arc<App>>, headers: HeaderMap, Path(id): Path<String>) -> Result<Response, ApiError> {
     let none = || err(StatusCode::NOT_FOUND, "not-found", "Вложение не найдено");
-    let (user, _, _) = app.auth(&headers).await?;
+    let (user, _, _) = app.auth_for(&headers, "support").await?;
     app.window(&format!("support:{}", user.id), 1200, 3_600_000)?;
     let id = number(&id).ok_or_else(none)?;
     let c = app.pool.get().await?;
     let (name, mime, data) = db::ticket_file(&c, id, user.id, is_staff(&app, &user)).await?.ok_or_else(none)?;
-    let head = [
-        (CONTENT_TYPE, mime),
-        (CONTENT_DISPOSITION, format!("attachment; filename*=UTF-8''{}", encode_name(&name))),
-        (X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
-        (CACHE_CONTROL, "private, max-age=3600".to_string()),
-    ];
-    Ok((head, data).into_response())
+    Ok(file_response(&name, mime, data))
 }
 
 /// Счётчик для значка в браузере: свои обращения с непрочитанным ответом поддержки, а для
 /// сотрудника ещё и очередь — обращения всех пользователей, ждущие ответа.
 pub async fn unread(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
-    let (user, _, _) = app.auth(&headers).await?;
+    let (user, _, _) = app.auth_for(&headers, "support").await?;
     app.window(&format!("support-unread:{}", user.id), 600, 3_600_000)?;
     let staff = is_staff(&app, &user);
     let c = app.pool.get().await?;
@@ -514,6 +578,215 @@ pub async fn unread(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResul
         out["queue"] = json!(db::tickets_open(&c).await?);
     }
     Ok(Json(out))
+}
+
+/* ---- requests without an account ---- */
+
+/// The address of a request without an account on the support site. The key is after "#": a
+/// browser does not send that part to a server, so it stays out of access logs.
+fn guest_link(app: &App, id: i64, key: &str) -> String {
+    format!("{}/#t={id}.{key}", app.support_url)
+}
+
+/// "<number>.<secret>" from a link.
+fn guest_ref(raw: &str) -> Option<(i64, &str)> {
+    let (id, key) = raw.trim().split_once('.')?;
+    let ok = key.len() == GUEST_KEY_BYTES * 4 / 3 && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    Some((number(id)?, key)).filter(|_| ok)
+}
+
+/// The request a link leads to. A wrong number and a wrong secret are answered the same.
+fn guest_match(t: Option<Ticket>, key: &str) -> Result<Ticket, ApiError> {
+    let t = t.filter(|t| t.is_guest()).ok_or_else(no_ticket)?;
+    let stored = t.guest_key.as_deref().unwrap_or("");
+    if stored.is_empty() || !same(stored.as_bytes(), key.as_bytes()) {
+        return Err(no_ticket());
+    }
+    Ok(t)
+}
+
+/// The request as its author sees it, with what the page needs to know about a guest's request.
+async fn guest_json<C: GenericClient>(c: &C, id: i64) -> ApiResult {
+    let t = db::ticket(c, id).await?.ok_or_else(no_ticket)?;
+    let mut v = ticket_json(c, &t, false).await?;
+    v["guest"] = json!(true);
+    v["email"] = json!(t.author);
+    Ok(Json(v))
+}
+
+fn guest_calls(app: &App, headers: &HeaderMap) -> Result<String, ApiError> {
+    let ip = client_ip(headers);
+    app.window(&format!("support-guest:{ip}"), GUEST_CALLS_PER_IP_HOUR, 3_600_000)?;
+    Ok(ip)
+}
+
+#[derive(Deserialize)]
+pub struct GuestBody {
+    email: String,
+    subject: String,
+    text: String,
+    #[serde(default)]
+    lang: Option<String>,
+}
+
+/// `POST /v1/support/guest` — a request from someone without an account. Nothing reaches support
+/// yet: a letter with a link goes to the address, and the request waits until the link is opened.
+pub async fn guest_create(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> ApiResult {
+    let ip = guest_calls(&app, &headers)?;
+    let b: GuestBody = parse(&body)?;
+    let email = clean_address(&b.email).ok_or_else(|| invalid("Укажите адрес электронной почты, на который придёт ответ"))?;
+    if email.ends_with(&format!("@{}", app.domain)) {
+        // the letter would go to a mailbox that cannot be opened without the sign-in this person lacks
+        return Err(invalid("Ответ придёт письмом, а ящик Tabora открывается только после входа. Укажите другой адрес или войдите в аккаунт"));
+    }
+    let subject = clean_subject(&b.subject)?;
+    let text = clean_text(&b.text)?;
+    let lang = b.lang.as_deref().filter(|l| crate::i18n::LANGS.contains(l)).unwrap_or("ru").to_string();
+    if !app.mail.can_send() {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "mail-unavailable", "Сервер сейчас не отправляет письма: без письма обращение не подтвердить. Повторите позже"));
+    }
+    let now = now_ms();
+    let busy = || limit("С вашего адреса уже отправлено несколько обращений. Откройте ссылку из письма или повторите позже");
+    app.limiter.hit(&format!("support-guest-new:{ip}"), GUEST_PER_IP_HOUR, 3_600_000, now).map_err(|_| busy())?;
+    app.limiter.hit(&format!("support-guest-day:{ip}"), GUEST_PER_IP_DAY, 86_400_000, now).map_err(|_| busy())?;
+    // letters with links have their own share of the server's daily letters: the codes for
+    // password resets go out of the rest
+    app.limiter
+        .hit("support-guest-mail", (app.mail_daily_cap / 4).max(1), 86_400_000, now)
+        .map_err(|_| limit("Сегодня отправлено слишком много обращений. Повторите завтра"))?;
+    let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random::<GUEST_KEY_BYTES>());
+    let mut c = app.pool.get().await?;
+    let tx = c.transaction().await?;
+    // one at a time for an address: two requests sent together are counted one after another
+    tx.execute("SELECT pg_advisory_xact_lock(hashtext($1))", &[&format!("support-guest:{email}")]).await.map_err(db::DbError::from)?;
+    let (pending, recent) = db::guest_ticket_counts(&tx, &email, now - 86_400_000).await?;
+    if pending >= GUEST_PENDING_PER_ADDRESS || recent >= GUEST_PER_ADDRESS_DAY {
+        return Err(limit("На этот адрес уже отправлены письма со ссылками. Откройте ссылку из письма или повторите завтра"));
+    }
+    let id = db::insert_guest_ticket(&tx, &email, &key, &lang, &subject, now).await?;
+    db::insert_ticket_message(&tx, id, false, None, &text, now).await?;
+    tx.commit().await?;
+    let letter = format!(
+        "Кто-то — возможно, вы — написал в поддержку Tabora и указал этот адрес для ответа.\n\nЧтобы обращение дошло до поддержки, откройте ссылку:\n{}\n\nПо этой же ссылке будет наш ответ. Ссылка действует как ключ к обращению: не пересылайте её.\n\nЕсли вы ничего не писали, ничего делать не нужно: без перехода по ссылке обращение удалится само.",
+        guest_link(&app, id, &key)
+    );
+    if let Err(e) = app.send_mail_in(&email, &format!("Tabora: подтвердите обращение № {id}"), &letter, Some(&lang)).await {
+        // without the letter the request can never be confirmed: it is not kept
+        let _ = db::delete_ticket(&c, id).await;
+        return Err(e);
+    }
+    Ok(Json(json!({ "sent": true })))
+}
+
+#[derive(Deserialize)]
+pub struct GuestKeyBody {
+    key: String,
+}
+
+/// `POST /v1/support/guest/open` — the request by its link. The first opening confirms the
+/// author's address: from that moment support sees the request and is told about it.
+pub async fn guest_open(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> ApiResult {
+    guest_calls(&app, &headers)?;
+    let b: GuestKeyBody = parse(&body)?;
+    let (id, key) = guest_ref(&b.key).ok_or_else(no_ticket)?;
+    let mut c = app.pool.get().await?;
+    let tx = c.transaction().await?;
+    let t = guest_match(db::ticket_for_update(&tx, id).await?, key)?;
+    let now = now_ms();
+    let first = db::confirm_guest_ticket(&tx, id, now.max(t.updated_at + 1)).await?;
+    db::mark_ticket_read(&tx, id, false, now).await?;
+    tx.commit().await?;
+    let out = guest_json(&c, id).await?;
+    if first {
+        let text = db::ticket_messages(&c, id).await?.first().map(|m| m.body.clone()).unwrap_or_default();
+        let note = format!("Автор: {} (без аккаунта)\nТема: {}\n\n{}\n\nОтветить можно в браузере (Настройки → Поддержка) или на сайте {}", t.author, t.subject, excerpt(&text, 600), app.support_url);
+        notify_staff(&app, &format!("g{id}"), id, format!("Новое обращение № {id}: {}", t.subject), note);
+    }
+    Ok(out)
+}
+
+#[derive(Deserialize)]
+pub struct GuestMessageBody {
+    key: String,
+    text: String,
+}
+
+/// `POST /v1/support/guest/messages` — the author's new message in a request without an account.
+pub async fn guest_reply(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> ApiResult {
+    guest_calls(&app, &headers)?;
+    let b: GuestMessageBody = parse(&body)?;
+    let (id, key) = guest_ref(&b.key).ok_or_else(no_ticket)?;
+    let text = clean_text(&b.text)?;
+    let now = now_ms();
+    let mut c = app.pool.get().await?;
+    let tx = c.transaction().await?;
+    let t = guest_match(db::ticket_for_update(&tx, id).await?, key)?;
+    if !t.guest_confirmed {
+        return Err(no_ticket()); // the page opens the request first, and that confirms it
+    }
+    if db::ticket_message_count(&tx, id).await? >= MESSAGES_MAX {
+        return Err(limit("В этом обращении слишком много сообщений: создайте новое"));
+    }
+    app.limiter
+        .hit(&format!("support-msg:g{id}"), GUEST_MESSAGES_PER_HOUR, 3_600_000, now)
+        .map_err(|ms| limit(format!("Слишком много сообщений подряд. Повторите через {}", wait_text(ms))))?;
+    let at = now.max(t.updated_at + 1).max(t.user_read_at + 1).max(t.staff_read_at + 1);
+    db::insert_ticket_message(&tx, id, false, None, &text, at).await?;
+    db::ticket_after_message(&tx, id, "open", at, false).await?;
+    tx.commit().await?;
+    let out = guest_json(&c, id).await?;
+    drop(c);
+    let note = format!("Автор: {} (без аккаунта)\nТема: {}\n\n{}\n\nОтветить можно в браузере (Настройки → Поддержка) или на сайте {}", t.author, t.subject, excerpt(&text, 600), app.support_url);
+    notify_staff(&app, &format!("g{id}"), id, format!("Ответ в обращении № {id}: {}", t.subject), note);
+    Ok(out)
+}
+
+#[derive(Deserialize)]
+pub struct GuestStatusBody {
+    key: String,
+    status: String,
+}
+
+/// `POST /v1/support/guest/status` — the author closes the request or opens it again.
+pub async fn guest_status(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> ApiResult {
+    guest_calls(&app, &headers)?;
+    let b: GuestStatusBody = parse(&body)?;
+    let (id, key) = guest_ref(&b.key).ok_or_else(no_ticket)?;
+    if b.status != "closed" && b.status != "open" {
+        return Err(invalid("Обращение можно только закрыть или открыть снова"));
+    }
+    let mut c = app.pool.get().await?;
+    let tx = c.transaction().await?;
+    let t = guest_match(db::ticket_for_update(&tx, id).await?, key)?;
+    if !t.guest_confirmed {
+        return Err(no_ticket());
+    }
+    if t.status != b.status {
+        db::set_ticket_status(&tx, id, &b.status, now_ms().max(t.updated_at + 1)).await?;
+    }
+    tx.commit().await?;
+    guest_json(&c, id).await
+}
+
+#[derive(Deserialize)]
+pub struct GuestFileBody {
+    key: String,
+    id: i64,
+}
+
+/// `POST /v1/support/guest/file` — an attachment of support's answer in a request without an account.
+pub async fn guest_file(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
+    let none = || err(StatusCode::NOT_FOUND, "not-found", "Вложение не найдено");
+    guest_calls(&app, &headers)?;
+    let b: GuestFileBody = parse(&body)?;
+    let (id, key) = guest_ref(&b.key).ok_or_else(none)?;
+    let c = app.pool.get().await?;
+    let t = guest_match(db::ticket(&c, id).await?, key).map_err(|_| none())?;
+    if !t.guest_confirmed || b.id <= 0 {
+        return Err(none());
+    }
+    let (name, mime, data) = db::ticket_file_of(&c, b.id, id).await?.ok_or_else(none)?;
+    Ok(file_response(&name, mime, data))
 }
 
 #[cfg(test)]

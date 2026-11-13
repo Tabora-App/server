@@ -193,6 +193,20 @@ CREATE TABLE IF NOT EXISTS ticket_files (
 );
 CREATE INDEX IF NOT EXISTS ticket_files_message ON ticket_files (message_id);
 CREATE INDEX IF NOT EXISTS ticket_files_ticket ON ticket_files (ticket_id);
+-- A sign-in for one purpose. '' is an ordinary session; 'support' is a session of the support
+-- site: it reaches the support requests of its account and nothing else (api.rs: auth_for).
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT '';
+-- Requests from people without an account (the support site). Such a request has no user_id:
+-- its author is known by an e-mail address. Support sees it only after the address is confirmed
+-- with the link from the letter (guest_confirmed_at); guest_key is the secret of that link, and
+-- whoever has the link reads the request and answers in it. guest_lang is the language of the
+-- letters to the author.
+ALTER TABLE tickets ALTER COLUMN user_id DROP NOT NULL;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS guest_email TEXT;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS guest_key TEXT;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS guest_lang TEXT;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS guest_confirmed_at BIGINT;
+CREATE INDEX IF NOT EXISTS tickets_guest ON tickets (guest_email) WHERE guest_email IS NOT NULL;
 "#;
 
 #[derive(Debug)]
@@ -408,11 +422,11 @@ pub async fn forget_device<C: GenericClient>(c: &C, user_id: i64, device_id: &st
         .await?)
 }
 
-pub async fn create_session<C: GenericClient>(c: &C, token_hash: &[u8], user_id: i64, device_id: &str, now: i64) -> Result<(), DbError> {
+pub async fn create_session<C: GenericClient>(c: &C, token_hash: &[u8], user_id: i64, device_id: &str, now: i64, scope: &str) -> Result<(), DbError> {
     // expires_at не читается (сессия бессрочна); столбец обязателен в прежней схеме — пишем 0
     c.execute(
-        "INSERT INTO sessions (token_hash, user_id, device_id, created_at, expires_at, last_seen) VALUES ($1, $2, $3, $4, 0, $4)",
-        &[&token_hash, &user_id, &device_id, &now],
+        "INSERT INTO sessions (token_hash, user_id, device_id, created_at, expires_at, last_seen, scope) VALUES ($1, $2, $3, $4, 0, $4, $5)",
+        &[&token_hash, &user_id, &device_id, &now, &scope],
     )
     .await?;
     Ok(())
@@ -421,10 +435,11 @@ pub async fn create_session<C: GenericClient>(c: &C, token_hash: &[u8], user_id:
 /// Действующая сессия: пользователь и устройство. Срока у сессии нет: она действует, пока строка
 /// не удалена (выход, отзыв устройства, смена или сброс пароля). Отметка «был в сети» обновляется
 /// не чаще раза в час.
-pub async fn session<C: GenericClient>(c: &C, token_hash: &[u8], now: i64) -> Result<Option<(User, String)>, DbError> {
+/// The session of a token: its account, its device and its scope ('' is an ordinary session).
+pub async fn session<C: GenericClient>(c: &C, token_hash: &[u8], now: i64) -> Result<Option<(User, String, String)>, DbError> {
     let row = c
         .query_opt(
-            "SELECT u.id, u.public_id, u.email, u.salt, u.verifier, u.kdf, u.recovery, u.mail_id, s.device_id, s.last_seen
+            "SELECT u.id, u.public_id, u.email, u.salt, u.verifier, u.kdf, u.recovery, u.mail_id, s.device_id, s.last_seen, s.scope
              FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = $1",
             &[&token_hash],
         )
@@ -437,7 +452,7 @@ pub async fn session<C: GenericClient>(c: &C, token_hash: &[u8], now: i64) -> Re
         c.execute("UPDATE sessions SET last_seen = $2 WHERE token_hash = $1", &[&token_hash, &now]).await?;
         c.execute("UPDATE devices SET last_seen = $3 WHERE user_id = $1 AND device_id = $2", &[&u.id, &device_id, &now]).await?;
     }
-    Ok(Some((u, device_id)))
+    Ok(Some((u, device_id, row.get(10))))
 }
 
 /// Язык писем для адреса: свой ящик аккаунта, его резервный адрес или адрес, ждущий
@@ -486,8 +501,13 @@ pub async fn purge_expired<C: GenericClient>(c: &C, now: i64) -> Result<u64, DbE
     let n = c.execute("DELETE FROM reset_nonces WHERE expires_at <= $1", &[&now]).await?;
     c.execute("DELETE FROM mail_codes WHERE expires_at <= $1", &[&now]).await?;
     c.execute("UPDATE users SET totp_pending = NULL, totp_pending_at = NULL WHERE totp_pending_at IS NOT NULL AND totp_pending_at <= $1", &[&(now - 3_600_000)]).await?;
+    // a request without an account whose address was not confirmed in two days: nobody opened the link
+    c.execute("DELETE FROM tickets WHERE guest_email IS NOT NULL AND guest_confirmed_at IS NULL AND created_at <= $1", &[&(now - GUEST_UNCONFIRMED_MS)]).await?;
     Ok(n)
 }
+
+/// How long a request without an account waits for its address to be confirmed.
+pub const GUEST_UNCONFIRMED_MS: i64 = 2 * 86_400_000;
 
 pub async fn put_nonce<C: GenericClient>(c: &C, user_id: i64, hash: &[u8], expires: i64) -> Result<(), DbError> {
     c.execute(
@@ -858,7 +878,8 @@ pub async fn sync_clear<C: GenericClient>(c: &C, user_id: i64) -> Result<(), DbE
 #[derive(Clone, Debug)]
 pub struct Ticket {
     pub id: i64,
-    pub user_id: i64,
+    /// the author's account; None for a request without an account
+    pub user_id: Option<i64>,
     pub subject: String,
     pub status: String,
     pub meta: Option<String>,
@@ -866,14 +887,41 @@ pub struct Ticket {
     pub updated_at: i64,
     pub user_read_at: i64,
     pub staff_read_at: i64,
-    /// адрес аккаунта автора
+    /// адрес аккаунта автора; у обращения без аккаунта — адрес, который указал автор
     pub author: String,
+    /// a request without an account: the secret of its link, the language of letters to the
+    /// author, and whether the author's address is confirmed
+    pub guest_key: Option<String>,
+    pub guest_lang: Option<String>,
+    pub guest_confirmed: bool,
 }
 
-const TICKET_SELECT: &str = "SELECT t.id, t.user_id, t.subject, t.status, t.meta, t.created_at, t.updated_at, t.user_read_at, t.staff_read_at, u.email FROM tickets t JOIN users u ON u.id = t.user_id";
+impl Ticket {
+    pub fn is_guest(&self) -> bool {
+        self.user_id.is_none()
+    }
+}
+
+const TICKET_SELECT: &str = "SELECT t.id, t.user_id, t.subject, t.status, t.meta, t.created_at, t.updated_at, t.user_read_at, t.staff_read_at, COALESCE(u.email, t.guest_email, ''), t.guest_key, t.guest_lang, t.guest_confirmed_at IS NOT NULL FROM tickets t LEFT JOIN users u ON u.id = t.user_id";
+/// What support sees: requests of accounts and confirmed requests without an account.
+const TICKET_VISIBLE: &str = "(t.user_id IS NOT NULL OR t.guest_confirmed_at IS NOT NULL)";
 
 fn ticket_row(r: &Row) -> Ticket {
-    Ticket { id: r.get(0), user_id: r.get(1), subject: r.get(2), status: r.get(3), meta: r.get(4), created_at: r.get(5), updated_at: r.get(6), user_read_at: r.get(7), staff_read_at: r.get(8), author: r.get(9) }
+    Ticket {
+        id: r.get(0),
+        user_id: r.get(1),
+        subject: r.get(2),
+        status: r.get(3),
+        meta: r.get(4),
+        created_at: r.get(5),
+        updated_at: r.get(6),
+        user_read_at: r.get(7),
+        staff_read_at: r.get(8),
+        author: r.get(9),
+        guest_key: r.get(10),
+        guest_lang: r.get(11),
+        guest_confirmed: r.get(12),
+    }
 }
 
 pub async fn ticket<C: GenericClient>(c: &C, id: i64) -> Result<Option<Ticket>, DbError> {
@@ -901,13 +949,13 @@ pub async fn tickets<C: GenericClient>(c: &C, viewer: i64, all: bool, status: Op
                 "SELECT s.*, (SELECT count(*) FROM ticket_messages m WHERE m.ticket_id = s.id),
                    EXISTS (SELECT 1 FROM ticket_messages m WHERE m.ticket_id = s.id AND
                      CASE WHEN s.user_id = $1 THEN m.staff AND m.created_at > s.user_read_at ELSE NOT m.staff AND m.created_at > s.staff_read_at END)
-                 FROM ({TICKET_SELECT} WHERE ($2::boolean OR t.user_id = $1) AND ($3::text IS NULL OR t.status = $3::text) ORDER BY t.updated_at DESC, t.id DESC LIMIT $4) s
+                 FROM ({TICKET_SELECT} WHERE (($2::boolean AND {TICKET_VISIBLE}) OR t.user_id = $1) AND ($3::text IS NULL OR t.status = $3::text) ORDER BY t.updated_at DESC, t.id DESC LIMIT $4) s
                  ORDER BY s.updated_at DESC, s.id DESC"
             ),
             &[&viewer, &all, &status, &limit],
         )
         .await?;
-    Ok(rows.iter().map(|r| TicketSummary { ticket: ticket_row(r), messages: r.get(10), unread: r.get(11) }).collect())
+    Ok(rows.iter().map(|r| TicketSummary { ticket: ticket_row(r), messages: r.get(13), unread: r.get(14) }).collect())
 }
 
 /// Сколько у пользователя незакрытых обращений и сколько создано после since. Строка
@@ -925,7 +973,43 @@ pub async fn insert_ticket<C: GenericClient>(c: &C, user_id: i64, subject: &str,
     Ok(c.query_one("INSERT INTO tickets (user_id, subject, meta, created_at, updated_at, user_read_at) VALUES ($1, $2, $3, $4, $4, $4) RETURNING id", &[&user_id, &subject, &meta, &now]).await?.get(0))
 }
 
-pub async fn insert_ticket_message<C: GenericClient>(c: &C, ticket_id: i64, staff: bool, author_id: i64, body: &str, at: i64) -> Result<i64, DbError> {
+/// A request without an account, not yet seen by support: the address is to be confirmed first.
+pub async fn insert_guest_ticket<C: GenericClient>(c: &C, email: &str, key: &str, lang: &str, subject: &str, now: i64) -> Result<i64, DbError> {
+    Ok(c
+        .query_one(
+            "INSERT INTO tickets (user_id, guest_email, guest_key, guest_lang, subject, created_at, updated_at, user_read_at) VALUES (NULL, $1, $2, $3, $4, $5, $5, $5) RETURNING id",
+            &[&email, &key, &lang, &subject, &now],
+        )
+        .await?
+        .get(0))
+}
+
+/// Requests without an account from one address: (waiting for confirmation, made after `since`).
+pub async fn guest_ticket_counts<C: GenericClient>(c: &C, email: &str, since: i64) -> Result<(i64, i64), DbError> {
+    let r = c
+        .query_one("SELECT count(*) FILTER (WHERE guest_confirmed_at IS NULL), count(*) FILTER (WHERE created_at > $2) FROM tickets WHERE guest_email = $1", &[&email, &since])
+        .await?;
+    Ok((r.get(0), r.get(1)))
+}
+
+/// The author's address is confirmed: from now on support sees the request. true if it was not confirmed before.
+pub async fn confirm_guest_ticket<C: GenericClient>(c: &C, id: i64, now: i64) -> Result<bool, DbError> {
+    Ok(c.execute("UPDATE tickets SET guest_confirmed_at = $2, updated_at = $2 WHERE id = $1 AND guest_confirmed_at IS NULL", &[&id, &now]).await? > 0)
+}
+
+pub async fn delete_ticket<C: GenericClient>(c: &C, id: i64) -> Result<(), DbError> {
+    c.execute("DELETE FROM tickets WHERE id = $1", &[&id]).await?;
+    Ok(())
+}
+
+/// An attachment of the given request (for the author of a request without an account).
+pub async fn ticket_file_of<C: GenericClient>(c: &C, id: i64, ticket_id: i64) -> Result<Option<(String, String, Vec<u8>)>, DbError> {
+    let row = c.query_opt("SELECT name, mime, data FROM ticket_files WHERE id = $1 AND ticket_id = $2", &[&id, &ticket_id]).await?;
+    Ok(row.map(|r| (r.get(0), r.get(1), r.get(2))))
+}
+
+/// author_id is empty for a message of an author without an account.
+pub async fn insert_ticket_message<C: GenericClient>(c: &C, ticket_id: i64, staff: bool, author_id: Option<i64>, body: &str, at: i64) -> Result<i64, DbError> {
     Ok(c.query_one("INSERT INTO ticket_messages (ticket_id, staff, author_id, body, created_at) VALUES ($1, $2, $3, $4, $5) RETURNING id", &[&ticket_id, &staff, &author_id, &body, &at]).await?.get(0))
 }
 
@@ -990,7 +1074,7 @@ pub async fn ticket_files<C: GenericClient>(c: &C, ticket_id: i64) -> Result<Vec
 /// Вложение (имя, тип, содержимое), если его обращение принадлежит viewer или viewer — поддержка.
 pub async fn ticket_file<C: GenericClient>(c: &C, id: i64, viewer: i64, staff: bool) -> Result<Option<(String, String, Vec<u8>)>, DbError> {
     let row = c
-        .query_opt("SELECT f.name, f.mime, f.data FROM ticket_files f JOIN tickets t ON t.id = f.ticket_id WHERE f.id = $1 AND (t.user_id = $2 OR $3::boolean)", &[&id, &viewer, &staff])
+        .query_opt(&format!("SELECT f.name, f.mime, f.data FROM ticket_files f JOIN tickets t ON t.id = f.ticket_id WHERE f.id = $1 AND (t.user_id = $2 OR ($3::boolean AND {TICKET_VISIBLE}))"), &[&id, &viewer, &staff])
         .await?;
     Ok(row.map(|r| (r.get(0), r.get(1), r.get(2))))
 }
@@ -1008,7 +1092,7 @@ pub async fn tickets_unread<C: GenericClient>(c: &C, user_id: i64) -> Result<i64
 
 /// Очередь поддержки: обращения всех пользователей, ждущие ответа.
 pub async fn tickets_open<C: GenericClient>(c: &C) -> Result<i64, DbError> {
-    Ok(c.query_one("SELECT count(*) FROM tickets WHERE status = 'open'", &[]).await?.get(0))
+    Ok(c.query_one(&format!("SELECT count(*) FROM tickets t WHERE t.status = 'open' AND {TICKET_VISIBLE}"), &[]).await?.get(0))
 }
 
 pub async fn setting<C: GenericClient>(c: &C, key: &str) -> Result<Option<String>, DbError> {

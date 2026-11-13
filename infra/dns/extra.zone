@@ -5,5 +5,9 @@
 ; nginx: infra/nginx/app.conf; сертификат выпускает infra/enable-tls.sh.
 app.tabora.app. IN CNAME mx.tabora.app.
 
+; The support site: the same server, directly (no Cloudflare Tunnel), grey cloud.
+; nginx: infra/nginx/support.conf; the certificate is issued by infra/enable-tls.sh.
+support.tabora.app. IN CNAME mx.tabora.app.
+
 ; Google: подтверждение владения доменом (добавлено 11 ноября 2026)
 tabora.app. IN TXT "google-site-verification=r-AdBqqC_oQMgWpKhR1yZGHYZlFiRjw5cETqUtTXcxg"

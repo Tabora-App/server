@@ -116,6 +116,12 @@ async fn main() {
         s if s.is_empty() => None,
         s => Some(util::clean_address(&s).unwrap_or_else(|| fail("TABORA_SUPPORT_NOTIFY должен быть адресом электронной почты"))),
     };
+    // the support site: letters about requests link to it
+    let support_url = match env("TABORA_SUPPORT_URL") {
+        s if s.is_empty() => format!("https://support.{domain}"),
+        s if s.starts_with("https://") || s.starts_with("http://") => s.trim_end_matches('/').to_string(),
+        _ => fail("TABORA_SUPPORT_URL должен быть адресом сайта поддержки (https://…)"),
+    };
     let stalwart = mail::Stalwart::new(&env("STALWART_URL"), &env("STALWART_API_KEY"), &domain, mail_key, quota, outbox);
     let app = Arc::new(api::App {
         domain: domain.clone(),
@@ -134,6 +140,7 @@ async fn main() {
         alias_max: env_num("TABORA_ALIAS_MAX", 100),
         support_staff,
         support_notify,
+        support_url,
     });
 
     // уборка раз в час: истёкшие сессии и nonce, старые счётчики ограничителей

@@ -8,7 +8,7 @@ failed() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $1" > "$mark"; logger -t tabora-
 case "${RENEWED_LINEAGE:-}" in
   */__MAIL_HOST__) ;;
   # сертификат веб-версии нужен только nginx
-  */app.__DOMAIN__) systemctl reload nginx || failed "nginx не перечитал конфигурацию"; exit 0 ;;
+  */app.__DOMAIN__|*/support.__DOMAIN__) systemctl reload nginx || failed "nginx не перечитал конфигурацию"; exit 0 ;;
   *) exit 0 ;;
 esac
 systemctl reload nginx || failed "nginx не перечитал конфигурацию"

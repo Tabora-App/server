@@ -862,7 +862,7 @@ check(
   r.text
 );
 letter = await lastMail(U.email, { after: t0 - 5 });
-check("пользователю ушло письмо с ответом поддержки", !!letter && letter.subject === "Ответ поддержки Tabora: Не открывается почта" && letter.text.includes("Очистите кеш и перезапустите браузер.") && letter.text.includes("Ответить можно в браузере: Настройки → Поддержка"), JSON.stringify(letter));
+check("пользователю ушло письмо с ответом поддержки", !!letter && letter.subject === "Ответ поддержки Tabora: Не открывается почта" && letter.text.includes("Очистите кеш и перезапустите браузер.") && letter.text.includes("Ответить можно в браузере (Настройки → Поддержка) или на сайте https://support."), JSON.stringify(letter));
 r = await sup(U, "GET", "/unread");
 check("у пользователя один непрочитанный ответ", r.status === 200 && r.json.count === 1 && r.json.staff === false, r.text);
 row = byId((await sup(U, "GET", "/tickets")).json, U.t);
@@ -981,6 +981,120 @@ try {
   tooBig = "обрыв";
 }
 check(`запрос обращения больше 12 МиБ не принимается (${tooBig})`, (tooBig === "400 support-invalid" || tooBig === "обрыв") && (await sup(H, "GET", "/tickets")).json.tickets.length === 1, tooBig);
+
+// ---- сайт поддержки: вход «только поддержка» ----
+const W = { email: mail("w"), pw: hash("w-pass"), ip: "198.51.100.93" };
+r = await call("POST", "/v1/account/register", { body: { email: W.email, loginHash: W.pw, kdf: 2, deviceId: device(83), deviceName: "Мак" }, ip: W.ip });
+W.s = r.json?.session?.token;
+r = await sup(W, "POST", "/tickets", { subject: "Вопрос с компьютера", text: "Написано в браузере" });
+const wTicket = r.json?.id;
+r = await call("POST", "/v1/account/login", { body: { email: W.email, loginHash: W.pw, deviceId: device(84), deviceName: "Сайт поддержки: Chrome, Mac", scope: "support" }, ip: W.ip });
+const SD = { s: r.json?.session?.token, ip: W.ip };
+check("вход с сайта поддержки: сессия выдана, доступа к почте в ответе нет", r.status === 200 && !!SD.s && r.json.mail === null && !!wTicket, r.text);
+r = await call("POST", "/v1/account/login", { body: { email: W.email, loginHash: W.pw, deviceId: device(85), deviceName: "x", scope: "everything" }, ip: W.ip });
+check("неизвестное назначение входа → 400", r.status === 400 && r.json.code === "bad-request", r.text);
+r = await sup(SD, "GET", "/tickets");
+let r2 = await sup(SD, "GET", `/tickets/${wTicket}`);
+check("сессия сайта поддержки видит обращения своего аккаунта", r.status === 200 && r.json.tickets.length === 1 && r.json.tickets[0].id === wTicket && r2.status === 200 && r2.json.messages[0].text === "Написано в браузере", r.text);
+r = await sup(SD, "POST", `/tickets/${wTicket}/messages`, { text: "Дополнение с сайта", files: [shot] });
+r2 = await sup(SD, "POST", "/tickets", { subject: "Второе обращение с сайта", text: "Создано на сайте поддержки" });
+const dTicket = r2.json?.id;
+check("…пишет в них, прикладывает файлы и создаёт новые", r.status === 200 && r.json.messages.length === 2 && r.json.messages[1].files.length === 1 && r2.status === 200 && !!dTicket, r.text + r2.text);
+r = await download(SD, (await sup(SD, "GET", `/tickets/${wTicket}`)).json.messages[1].files[0].id);
+r2 = await sup(SD, "POST", `/tickets/${dTicket}/status`, { status: "closed" });
+check("…скачивает вложения, закрывает обращения и читает счётчик", r.status === 200 && r.body.equals(png) && r2.status === 200 && r2.json.status === "closed" && (await sup(SD, "GET", "/unread")).status === 200, `${r.status} ${r2.text}`);
+codes = [];
+for (const [method, path, body] of [
+  ["GET", "/v1/account/devices"], ["GET", "/v1/account/security"], ["GET", "/v1/mail/aliases"], ["GET", "/v1/mail/pgp"], ["POST", "/v1/mail/password", {}], ["GET", "/v1/sync?since=0"], ["GET", "/v1/mail/jmap/session"],
+  ["POST", "/v1/mail/aliases", {}], ["POST", "/v1/account/password", { oldLoginHash: W.pw, newLoginHash: hash("w-other"), kdf: 2 }], ["POST", "/v1/pair/start", {}],
+  ["POST", "/v1/sync", { gen: 1, keyId: "k", items: [] }], ["POST", "/v1/account/2fa/setup", { loginHash: W.pw }],
+]) {
+  r = await call(method, path, { token: SD.s, ip: SD.ip, body });
+  codes.push(`${r.status} ${r.json?.code}`);
+}
+check("…а к устройствам, настройкам входа, почте, ключам и синхронизации не допускается: 403", codes.every(c => c === "403 session-scope"), codes.join(" | "));
+r = await call("POST", "/v1/account/login", { body: { email: W.email, loginHash: W.pw, deviceId: device(83), deviceName: "Мак" }, ip: W.ip });
+check("пароль аккаунта такой сессией не сменить: обычный вход по-прежнему проходит", r.status === 200 && !!r.json.session?.token, r.text);
+r = await call("GET", "/v1/account/devices", { token: W.s, ip: W.ip });
+check("вход сайта поддержки виден в списке устройств аккаунта", r.status === 200 && r.json.some(d => d.name === "Сайт поддержки: Chrome, Mac" && d.active), r.text);
+r = await call("POST", "/v1/account/logout", { token: SD.s, ip: SD.ip });
+r2 = await sup(SD, "GET", "/tickets");
+check("сессия сайта поддержки завершается выходом", r.status === 200 && r2.status === 401 && r2.json.code === "session-expired", `${r.status} ${r2.text}`);
+
+// ---- обращения без аккаунта ----
+const G = { ip: "203.0.113.200", email: "guest.person@example.org" };
+const guest = (tail, body, ip = G.ip) => call("POST", "/v1/support/guest" + tail, { body, ip });
+const guestDownload = async (key, id) => {
+  const res = await fetch(`${BASE}/v1/support/guest/file`, { method: "POST", headers: { "Content-Type": "application/json", "X-Forwarded-For": G.ip }, body: JSON.stringify({ key, id }) });
+  return { status: res.status, headers: res.headers, body: Buffer.from(await res.arrayBuffer()) };
+};
+const queueBefore = (await sup(H, "GET", "/unread")).json.queue;
+const notifyBefore = mailsTo(NOTIFY).length;
+for (const [what, body] of [
+  ["без адреса", { subject: "Тема обращения", text: "Текст" }],
+  ["негодный адрес", { email: "not-an-address", subject: "Тема обращения", text: "Текст" }],
+  ["адрес в домене Tabora", { email: mail("u"), subject: "Тема обращения", text: "Текст" }],
+  ["короткая тема", { email: G.email, subject: "ab", text: "Текст" }],
+  ["пустой текст", { email: G.email, subject: "Тема обращения", text: "   " }],
+  ["слишком длинный текст", { email: G.email, subject: "Тема обращения", text: "я".repeat(8001) }],
+]) {
+  r = await guest("", body, "203.0.113.201");
+  check(`обращение без аккаунта: ${what} → 400`, r.status === 400 && r.json.code === "support-invalid" && !!r.json.message, r.text);
+}
+check("отклонённые обращения без аккаунта писем не вызвали", mailsTo(G.email).length === 0 && mailsTo(mail("u")).every(m => !/подтвердите/.test(m.subject)));
+r = await guest("", { email: " Guest.Person@Example.org ", subject: "Не могу войти в аккаунт", text: "СЕКРЕТНЫЙ ТЕКСТ АВТОРА: забыл пароль", lang: "en" });
+let letters = mailsTo(G.email);
+const link = (letters[0]?.text.match(/https:\/\/support\.[a-z.]+\/#t=(\d+\.[A-Za-z0-9_-]{32})/) || [])[1] || "";
+const gId = Number(link.split(".")[0]);
+check("обращение без аккаунта принято: ответ ничего не раскрывает, на адрес ушло одно письмо со ссылкой", r.status === 200 && JSON.stringify(r.json) === '{"sent":true}' && letters.length === 1 && gId > 0, r.text + JSON.stringify(letters).slice(0, 300));
+check("письмо — на языке обращения и без текста автора", /^Tabora: confirm support request #\d+$/.test(letters[0]?.subject || "") && !/[а-яё]/i.test(letters[0]?.text || "x") && !/СЕКРЕТНЫЙ|Не могу войти/.test(JSON.stringify(letters[0] || {})), JSON.stringify(letters[0] || {}).slice(0, 400));
+r = await sup(H, "GET", "/tickets?scope=all");
+r2 = await sup(H, "GET", `/tickets/${gId}`);
+check("до подтверждения адреса поддержка обращения не видит и письма о нём не получает", !byId(r.json, gId) && r2.status === 404 && (await sup(H, "GET", "/unread")).json.queue === queueBefore && mailsTo(NOTIFY).length === notifyBefore, r2.text);
+codes = [];
+for (const key of [`${gId}.${"A".repeat(32)}`, `${gId + 999}.${link.split(".")[1]}`, `${wTicket}.${link.split(".")[1]}`, "nope", `${gId}.short`, ""]) {
+  codes.push((await guest("/open", { key })).status);
+}
+check("чужой, неверный и негодный ключ ссылки → 404, обращение аккаунта ключом не открыть", codes.every(c => c === 404), codes.join());
+r = await guest("/messages", { key: link, text: "до подтверждения" });
+check("до открытия ссылки в обращение не написать", r.status === 404, r.text);
+r = await guest("/open", { key: link });
+check("ссылка открывает обращение автору", r.status === 200 && r.json.id === gId && r.json.guest === true && r.json.email === G.email && r.json.staff === false && r.json.status === "open" && r.json.messages.length === 1 && r.json.messages[0].from === "user" && /СЕКРЕТНЫЙ ТЕКСТ/.test(r.json.messages[0].text) && !("author" in r.json) && !("meta" in r.json), r.text);
+await new Promise(done => setTimeout(done, 400));
+r = await sup(H, "GET", "/tickets?scope=all");
+r2 = await sup(H, "GET", `/tickets/${gId}`);
+let notes = mailsTo(NOTIFY).slice(notifyBefore);
+check("после открытия ссылки обращение видно поддержке с пометкой «без аккаунта», ей ушло письмо", byId(r.json, gId)?.author === G.email && byId(r.json, gId)?.guest === true && byId(r.json, gId)?.unread === true && r2.status === 200 && r2.json.guest === true && r2.json.author === G.email && (await sup(H, "GET", "/unread")).json.queue === queueBefore + 1 && notes.length === 1 && /без аккаунта/.test(notes[0].text) && notes[0].subject === `Новое обращение № ${gId}: Не могу войти в аккаунт`, JSON.stringify(notes).slice(0, 300));
+await guest("/open", { key: link });
+check("повторное открытие ссылки второго письма поддержке не шлёт", mailsTo(NOTIFY).length === notifyBefore + 1);
+check("посторонний аккаунт обращения без аккаунта не видит", (await sup(U, "GET", `/tickets/${gId}`)).status === 404 && !byId((await sup(U, "GET", "/tickets")).json, gId));
+r = await sup(H, "POST", `/tickets/${gId}/messages`, { text: "Здравствуйте! Сбросьте пароль ключом восстановления.", files: [{ name: "how.txt", type: "text/plain", data: note.toString("base64") }] });
+await new Promise(done => setTimeout(done, 400));
+letters = mailsTo(G.email);
+check("ответ поддержки уходит автору письмом на его языке, с текстом ответа и той же ссылкой", r.status === 200 && r.json.status === "answered" && letters.length === 2 && /^Reply from Tabora support: /.test(letters[1].subject) && letters[1].text.includes("Сбросьте пароль ключом восстановления") && letters[1].text.includes(`/#t=${link}`) && !/Настройки → Поддержка|Settings/.test(letters[1].text), JSON.stringify(letters[1] || {}).slice(0, 400));
+r = await guest("/open", { key: link });
+const gFile = r.json?.messages?.[1]?.files?.[0];
+r2 = await guestDownload(link, gFile?.id);
+const foreignFile = (await sup(W, "GET", `/tickets/${wTicket}`)).json.messages[1].files[0].id;
+check("автор видит ответ и скачивает его вложение; чужое вложение по своей ссылке не получить", r.json.status === "answered" && r.json.messages[1].from === "staff" && gFile?.name === "how.txt" && r2.status === 200 && r2.body.equals(note) && /^attachment;/.test(r2.headers.get("content-disposition") || "") && (await guestDownload(link, foreignFile)).status === 404 && (await guestDownload(`${gId}.${"B".repeat(32)}`, gFile.id)).status === 404, `${r2.status}`);
+r = await guest("/messages", { key: link, text: "Спасибо, получилось" });
+await new Promise(done => setTimeout(done, 400)); // the letter to support goes out in the background
+notes = mailsTo(NOTIFY).slice(notifyBefore);
+check("ответ автора возвращает обращение в очередь, поддержке уходит письмо", r.status === 200 && r.json.status === "open" && r.json.messages.length === 3 && r.json.messages[2].from === "user" && notes.length === 2 && notes[1].subject === `Ответ в обращении № ${gId}: Не могу войти в аккаунт`, r.text);
+r = await guest("/status", { key: link, status: "closed" });
+r2 = await guest("/status", { key: link, status: "deleted" });
+check("автор закрывает обращение; иной статус → 400", r.status === 200 && r.json.status === "closed" && r2.status === 400 && r2.json.code === "support-invalid", r.text + r2.text);
+// пределы
+codes = [];
+for (let i = 0; i < 3; i++) {
+  codes.push((await guest("", { email: `limit${i}@example.org`, subject: "Проверка предела", text: "Текст" })).status);
+}
+check("с одного сетевого адреса — не больше трёх обращений без аккаунта в час", codes.join() === "200,200,429", codes.join());
+codes = [];
+for (let i = 0; i < 3; i++) {
+  codes.push((await guest("", { email: "flood@example.org", subject: "Проверка предела", text: "Текст" }, `203.0.113.${210 + i}`)).status);
+}
+check("на один адрес почты — не больше двух неподтверждённых обращений, с каких бы адресов их ни слали", codes.join() === "200,200,429" && mailsTo("flood@example.org").length === 2, codes.join());
 
 // пределы регистрации с одного адреса и прочее
 codes = [];

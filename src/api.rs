@@ -63,6 +63,8 @@ pub struct App {
     pub support_staff: Vec<String>,
     /// Куда писать о новых обращениях и ответах пользователей (None — не писать).
     pub support_notify: Option<String>,
+    /// The address of the support site, without a trailing slash: letters about requests link to it.
+    pub support_url: String,
 }
 
 #[derive(Debug)]
@@ -273,19 +275,36 @@ impl App {
     }
 
     pub(crate) async fn new_session(&self, c: &impl deadpool_postgres::GenericClient, user_id: i64, device_id: &str, now: i64) -> Result<Value, ApiError> {
+        self.new_scoped_session(c, user_id, device_id, now, "").await
+    }
+
+    /// A session of the given scope ('' is an ordinary one; see `auth_for`).
+    pub(crate) async fn new_scoped_session(&self, c: &impl deadpool_postgres::GenericClient, user_id: i64, device_id: &str, now: i64, scope: &str) -> Result<Value, ApiError> {
         let token = format!("tbs_{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random::<32>()));
         // срока у сессии нет: войдя один раз, человек остаётся в аккаунте, пока сам не выйдет
-        db::create_session(c, &sha256(token.as_bytes()), user_id, device_id, now).await?;
+        db::create_session(c, &sha256(token.as_bytes()), user_id, device_id, now, scope).await?;
         Ok(json!({ "token": token, "expiresAt": null }))
     }
 
+    /// An ordinary session: every request of the account. A session made for one purpose (the
+    /// support site) is refused here.
     pub(crate) async fn auth(&self, headers: &HeaderMap) -> Result<(User, String, [u8; 32]), ApiError> {
+        self.auth_for(headers, "").await
+    }
+
+    /// A session for the requests of one purpose: an ordinary session, or one whose scope is
+    /// exactly `scope`. A session of the support site ("support") is good only where this is
+    /// called with "support": its token gives no way to the mail, the keys or the settings.
+    pub(crate) async fn auth_for(&self, headers: &HeaderMap, scope: &str) -> Result<(User, String, [u8; 32]), ApiError> {
         // код session-expired — прежнее имя: сессия не истекает, а завершается (выход, отзыв, смена пароля)
         let expired = || err(StatusCode::UNAUTHORIZED, "session-expired", "Сессия завершена: войдите в аккаунт заново");
         let token = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).map(str::trim).filter(|t| !t.is_empty() && t.len() <= 128).ok_or_else(expired)?;
         let hash = sha256(token.as_bytes());
         let c = self.pool.get().await?;
-        let (user, device_id) = db::session(&c, &hash, now_ms()).await?.ok_or_else(expired)?;
+        let (user, device_id, session_scope) = db::session(&c, &hash, now_ms()).await?.ok_or_else(expired)?;
+        if !session_scope.is_empty() && session_scope != scope {
+            return Err(err(StatusCode::FORBIDDEN, "session-scope", "Этот вход действует только на сайте поддержки"));
+        }
         crate::i18n::remember(&c, user.id, headers).await;
         Ok((user, device_id, hash))
     }
@@ -367,6 +386,12 @@ impl App {
 
     /// Письмо от сервера: служебный ящик готовится при первом письме, в сутки не больше предела.
     pub(crate) async fn send_mail(&self, to: &str, subject: &str, text: &str) -> Result<(), ApiError> {
+        self.send_mail_in(to, subject, text, None).await
+    }
+
+    /// The same with the language given by the caller: a letter to an address that is not an
+    /// account's (the author of a support request without an account) has no account to take it from.
+    pub(crate) async fn send_mail_in(&self, to: &str, subject: &str, text: &str, lang: Option<&str>) -> Result<(), ApiError> {
         if !self.mail.can_send() {
             return Err(mail_err(MailError::Unavailable("почта выключена".into())));
         }
@@ -381,9 +406,12 @@ impl App {
             }
         }
         // письмо — на языке аккаунта, которому оно адресовано (ящик, резервный адрес, адрес с кодом)
-        let lang = match self.pool.get().await {
-            Ok(c) => db::lang_for_address(&c, to).await.unwrap_or_else(|_| "ru".to_string()),
-            Err(_) => "ru".to_string(),
+        let lang = match lang {
+            Some(l) => l.to_string(),
+            None => match self.pool.get().await {
+                Ok(c) => db::lang_for_address(&c, to).await.unwrap_or_else(|_| "ru".to_string()),
+                Err(_) => "ru".to_string(),
+            },
         };
         let (subject, text) = (crate::i18n::tr(&lang, subject), crate::i18n::tr(&lang, text));
         self.mail.send_system(to, &subject, &text).await.map_err(mail_err)
@@ -559,6 +587,10 @@ struct LoginBody {
     /// "session" — доступ к почте по сессии (веб-версия), без пароля приложения
     #[serde(default)]
     mail_access: Option<String>,
+    /// "support" — a sign-in of the support site: the session reaches only the support requests
+    /// and gets no access to the mail
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 async fn login(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> ApiResult {
@@ -566,6 +598,11 @@ async fn login(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> 
     app.window(&format!("login-ip:{ip}"), 30, 60_000)?;
     let b: LoginBody = parse(&body)?;
     let wrong = || err(StatusCode::UNAUTHORIZED, "bad-credentials", "Неверный адрес или пароль");
+    let scope = match b.scope.as_deref().unwrap_or("") {
+        "" => "",
+        "support" => "support",
+        _ => return Err(bad("bad-request", "Некорректный запрос: назначение входа")),
+    };
     check_device(&b.device_id)?;
     let Some((_, email)) = app.parse_email(&b.email) else { return Err(wrong()) };
     if !is_hex(&b.login_hash, 64) {
@@ -654,13 +691,14 @@ async fn login(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> 
     }
     let device_name = clean_name(&b.device_name, "Устройство");
     let old_cred = db::upsert_device(&c, user.id, &b.device_id, &device_name, now).await?;
-    let session = app.new_session(&c, user.id, &b.device_id, now).await?;
+    let session = app.new_scoped_session(&c, user.id, &b.device_id, now, scope).await?;
     crate::i18n::remember(&c, user.id, &headers).await;
     if !known {
         app.security_notice(&c, &user, "Tabora: вход с нового устройства", &format!("В аккаунт вошли с устройства, которого раньше не было: «{device_name}».\n\nЕсли это были вы, делать ничего не нужно. Если нет — смените пароль в настройках аккаунта и завершите сеанс этого устройства в списке устройств.")).await;
     }
     drop(c);
-    let mail = app.device_mail(&user, &b.device_id, &device_name, old_cred, b.mail_access.as_deref()).await;
+    // a sign-in of the support site gets nothing of the mail: neither an app password nor access by session
+    let mail = if scope.is_empty() { app.device_mail(&user, &b.device_id, &device_name, old_cred, b.mail_access.as_deref()).await } else { None };
     Ok(Json(json!({ "userId": user.public_id, "session": session, "kdf": user.kdf, "mail": mail })))
 }
 
@@ -819,7 +857,8 @@ async fn reset(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> 
 }
 
 async fn logout(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
-    let (user, device_id, token_hash) = app.auth(&headers).await?;
+    // any session may end itself, a session of the support site too
+    let (user, device_id, token_hash) = app.auth_for(&headers, "support").await?;
     let c = app.pool.get().await?;
     db::delete_session(&c, &token_hash).await?;
     if !db::has_session(&c, user.id, &device_id).await? {
@@ -1043,8 +1082,17 @@ async fn session_first(State(app): State<Arc<App>>, req: Request, next: Next) ->
     Ok(next.run(req).await)
 }
 
+/// The same for the support requests, which a session of the support site may make too.
+async fn support_session_first(State(app): State<Arc<App>>, req: Request, next: Next) -> Result<Response, ApiError> {
+    if req.method() == Method::POST {
+        app.auth_for(req.headers(), "support").await?;
+    }
+    Ok(next.run(req).await)
+}
+
 pub fn router(app: Arc<App>) -> Router {
     let session_first = || axum::middleware::from_fn_with_state(app.clone(), session_first);
+    let support_first = || axum::middleware::from_fn_with_state(app.clone(), support_session_first);
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/account/available", get(available))
@@ -1089,12 +1137,18 @@ pub fn router(app: Arc<App>) -> Router {
         // записи синхронизации и вложения обращений больше общего предела тела запроса
         .route("/v1/sync", get(sync::pull).post(sync::push).delete(sync::wipe).layer(DefaultBodyLimit::max(sync::MAX_BODY)).layer(session_first()))
         .route("/v1/sync/reset", post(sync::reset))
-        .route("/v1/support/tickets", get(support::list).post(support::create).layer(DefaultBodyLimit::max(support::MAX_BODY)).layer(session_first()))
+        .route("/v1/support/tickets", get(support::list).post(support::create).layer(DefaultBodyLimit::max(support::MAX_BODY)).layer(support_first()))
         .route("/v1/support/tickets/:id", get(support::ticket))
-        .route("/v1/support/tickets/:id/messages", post(support::reply).layer(DefaultBodyLimit::max(support::MAX_BODY)).layer(session_first()))
+        .route("/v1/support/tickets/:id/messages", post(support::reply).layer(DefaultBodyLimit::max(support::MAX_BODY)).layer(support_first()))
         .route("/v1/support/tickets/:id/status", post(support::set_status))
         .route("/v1/support/files/:id", get(support::file))
         .route("/v1/support/unread", get(support::unread))
+        // requests from people without an account (the support site): no session, access by the link's key
+        .route("/v1/support/guest", post(support::guest_create))
+        .route("/v1/support/guest/open", post(support::guest_open))
+        .route("/v1/support/guest/messages", post(support::guest_reply))
+        .route("/v1/support/guest/status", post(support::guest_status))
+        .route("/v1/support/guest/file", post(support::guest_file))
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(axum::middleware::map_response(no_store))
