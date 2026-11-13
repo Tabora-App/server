@@ -1110,6 +1110,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/account/2fa/setup", post(security::two_factor_setup))
         .route("/v1/account/2fa/enable", post(security::two_factor_enable))
         .route("/v1/account/2fa/disable", post(security::two_factor_disable))
+        .route("/v1/account/delete", post(security::delete_account))
         .route("/v1/account/2fa/codes", post(security::two_factor_codes))
         .route("/v1/account/backup-email", post(security::backup_email_set))
         .route("/v1/account/backup-email/verify", post(security::backup_email_verify))

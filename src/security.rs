@@ -150,6 +150,46 @@ pub async fn two_factor_disable(State(app): State<Arc<App>>, headers: HeaderMap,
     Ok(Json(json!({})))
 }
 
+/// `POST /v1/account/delete { loginHash, code? }` — the account is deleted at once and for good,
+/// after the password is checked again and, with two-step protection on, the code as well. What
+/// goes: the mailbox with all its mail and aliases, the encrypted sync data, the keys, the support
+/// requests, the devices and every session. The name and the aliases' addresses are never given
+/// out again. There is no way back and no waiting period: the owner asked for it this way.
+///
+/// The mailbox goes first: if the mail server cannot delete it now, nothing is deleted and the
+/// request can be repeated. A session of the support site cannot delete the account.
+pub async fn delete_account(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> ApiResult {
+    let (user, _, _) = app.auth(&headers).await?;
+    let b: Reauth = parse(&body)?;
+    app.reauth(&user, &b.login_hash, &client_ip(&headers))?;
+    let mut c = app.pool.get().await?;
+    let sec = db::security(&c, user.id).await?;
+    app.second_factor(&c, &user, &sec, b.code.as_deref()).await?;
+    // the farewell letter is written in the account's language, which is gone with the account
+    let lang = db::lang_for_address(&c, &user.email).await.unwrap_or_else(|_| "ru".to_string());
+    if let Some(mail_id) = user.mail_id.as_deref().filter(|_| app.mail.enabled()) {
+        app.mail.destroy_account(mail_id).await.map_err(crate::api::mail_err)?;
+    }
+    let tx = c.transaction().await?;
+    db::delete_user(&tx, user.id, crate::api::local_of(&user.email), now_ms()).await?;
+    tx.commit().await?;
+    drop(c);
+    eprintln!("аккаунт удалён: {}", user.public_id);
+    if let Some(to) = sec.backup_email {
+        let text = format!(
+            "Аккаунт {} удалён по запросу его владельца: почтовый ящик со всеми письмами, адреса для сайтов и данные синхронизации стёрты с сервера. Восстановить их нельзя, а адрес больше никому не выдаётся.\n\nПисьмо отправлено автоматически, отвечать на него не нужно.",
+            user.email
+        );
+        let app = app.clone();
+        tokio::spawn(async move {
+            if let Err(e) = app.send_mail_in(&to, "Tabora: аккаунт удалён", &text, Some(&lang)).await {
+                eprintln!("письмо об удалении аккаунта не отправлено: {}", e.code);
+            }
+        });
+    }
+    Ok(Json(json!({})))
+}
+
 /// Новые резервные коды; прежние перестают действовать.
 pub async fn two_factor_codes(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> ApiResult {
     let (user, _, _) = app.auth(&headers).await?;

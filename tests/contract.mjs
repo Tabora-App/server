@@ -1096,6 +1096,51 @@ for (let i = 0; i < 3; i++) {
 }
 check("на один адрес почты — не больше двух неподтверждённых обращений, с каких бы адресов их ни слали", codes.join() === "200,200,429" && mailsTo("flood@example.org").length === 2, codes.join());
 
+// ---- удаление аккаунта ----
+const X = { email: mail("x"), pw: hash("x-pass"), ip: "198.51.100.95" };
+r = await call("POST", "/v1/account/register", { body: { email: X.email, loginHash: X.pw, kdf: 2, deviceId: device(87), deviceName: "Мак" }, ip: X.ip });
+X.s = r.json?.session?.token;
+r = await sup(X, "POST", "/tickets", { subject: "Обращение удаляемого аккаунта", text: "Будет удалено вместе с аккаунтом" });
+const xTicket = r.json?.id;
+r = await call("POST", "/v1/account/login", { body: { email: X.email, loginHash: X.pw, deviceId: device(88), deviceName: "Сайт поддержки", scope: "support" }, ip: X.ip });
+const xDesk = r.json?.session?.token;
+r = await call("POST", "/v1/account/login", { body: { email: X.email, loginHash: X.pw, deviceId: device(89), deviceName: "Второй" }, ip: X.ip });
+const xOther = r.json?.session?.token;
+check("аккаунт для удаления готов: две сессии, сессия сайта поддержки, обращение", !!X.s && !!xDesk && !!xOther && !!xTicket && (await sup(H, "GET", `/tickets/${xTicket}`)).status === 200);
+r = await call("POST", "/v1/account/delete", { body: { loginHash: X.pw }, ip: X.ip });
+r2 = await call("POST", "/v1/account/delete", { token: xDesk, body: { loginHash: X.pw }, ip: X.ip });
+check("удаление без сессии → 401, сессией сайта поддержки → 403", r.status === 401 && r2.status === 403 && r2.json.code === "session-scope", `${r.status} ${r2.text}`);
+r = await call("POST", "/v1/account/delete", { token: X.s, body: { loginHash: hash("not-the-password") }, ip: X.ip });
+r2 = await call("POST", "/v1/account/delete", { token: X.s, body: {}, ip: X.ip });
+check("удаление с неверным паролем и без пароля не проходит, аккаунт цел", r.status === 401 && r.json.code === "bad-credentials" && r2.status === 400 && (await call("GET", "/v1/account/devices", { token: X.s, ip: X.ip })).status === 200, `${r.text} ${r2.text}`);
+r = await call("POST", "/v1/account/delete", { token: X.s, body: { loginHash: X.pw }, ip: X.ip });
+check("удаление с верным паролем проходит сразу", r.status === 200 && JSON.stringify(r.json) === "{}", r.text);
+codes = [];
+for (const token of [X.s, xOther, xDesk]) {
+  codes.push((await call("GET", "/v1/support/tickets", { token, ip: X.ip })).status);
+}
+r = await call("POST", "/v1/account/login", { body: { email: X.email, loginHash: X.pw, deviceId: device(87), deviceName: "Мак" }, ip: X.ip });
+check("после удаления все сессии завершены и войти нельзя", codes.join() === "401,401,401" && r.status === 401 && r.json.code === "bad-credentials", codes.join() + " " + r.text);
+r = await call("GET", `/v1/account/available?email=${encodeURIComponent(X.email)}`);
+r2 = await call("POST", "/v1/account/register", { body: { email: X.email, loginHash: hash("someone-else"), kdf: 2, deviceId: device(90), deviceName: "Чужой" }, ip: "198.51.100.96" });
+check("имя удалённого аккаунта больше не выдаётся", r.json.available === false && r2.status === 409, r.text + " " + r2.text);
+r = await sup(H, "GET", `/tickets/${xTicket}`);
+check("обращения удалённого аккаунта удалены вместе с ним", r.status === 404 && !byId((await sup(H, "GET", "/tickets?scope=all")).json, xTicket), r.text);
+
+// со вторым шагом: нужен ещё и код
+const Y = { email: mail("y"), pw: hash("y-pass"), ip: "198.51.100.97" };
+r = await call("POST", "/v1/account/register", { body: { email: Y.email, loginHash: Y.pw, kdf: 2, deviceId: device(91), deviceName: "Мак" }, ip: Y.ip });
+Y.s = r.json?.session?.token;
+r = await call("POST", "/v1/account/2fa/setup", { token: Y.s, body: { loginHash: Y.pw }, ip: Y.ip });
+Y.secret = r.json?.secret;
+r = await call("POST", "/v1/account/2fa/enable", { token: Y.s, body: { code: totp(Y.secret) }, ip: Y.ip });
+check("у второго аккаунта включён второй шаг", r.status === 200 && !!Y.secret, r.text);
+r = await call("POST", "/v1/account/delete", { token: Y.s, body: { loginHash: Y.pw }, ip: Y.ip });
+r2 = await call("POST", "/v1/account/delete", { token: Y.s, body: { loginHash: Y.pw, code: otherCode(totp(Y.secret, 1)) }, ip: Y.ip });
+check("со вторым шагом удаление без кода и с неверным кодом не проходит", r.status === 401 && r.json.code === "2fa-required" && r2.status === 401 && r2.json.code === "bad-2fa" && (await call("GET", "/v1/account/devices", { token: Y.s, ip: Y.ip })).status === 200, r.text + " " + r2.text);
+r = await call("POST", "/v1/account/delete", { token: Y.s, body: { loginHash: Y.pw, code: totp(Y.secret, 1) }, ip: Y.ip });
+check("с паролем и верным кодом аккаунт удаляется", r.status === 200 && (await call("GET", "/v1/account/devices", { token: Y.s, ip: Y.ip })).status === 401, r.text);
+
 // пределы регистрации с одного адреса и прочее
 codes = [];
 for (let i = 0; i < 7; i++) {

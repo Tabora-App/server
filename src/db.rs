@@ -278,6 +278,17 @@ pub async fn user_by_id<C: GenericClient>(c: &C, id: i64) -> Result<Option<User>
     Ok(c.query_opt(&format!("SELECT {USER_COLS} FROM users WHERE id = $1"), &[&id]).await?.as_ref().map(user))
 }
 
+/// The account is deleted for good. Its name and the addresses of its aliases go to the retired
+/// names first: they are never given out again, or letters meant for the former owner (password
+/// resets of other sites among them) would reach another person. Everything else of the account
+/// (devices, sessions, keys, sync data, support requests) goes with the row.
+pub async fn delete_user<C: GenericClient>(c: &C, id: i64, local: &str, now: i64) -> Result<(), DbError> {
+    c.execute("INSERT INTO retired_names (local, at) VALUES ($1, $2) ON CONFLICT (local) DO NOTHING", &[&local, &now]).await?;
+    c.execute("INSERT INTO retired_names (local, at) SELECT local, $2 FROM aliases WHERE user_id = $1 ON CONFLICT (local) DO NOTHING", &[&id, &now]).await?;
+    c.execute("DELETE FROM users WHERE id = $1", &[&id]).await?;
+    Ok(())
+}
+
 /// Занято ли имя: ящиком, алиасом (в том числе удалённым) или именем удалённого ящика.
 pub async fn name_taken<C: GenericClient>(c: &C, local: &str, email: &str) -> Result<bool, DbError> {
     let row = c

@@ -67,6 +67,7 @@ The account contract is defined by the browser:
 | `POST /v1/mail/jmap/upload/:account` | upload an attachment or a raw message (up to 52 MiB): `{ accountId, blobId, type, size }` |
 | `GET /v1/account/devices` (Bearer) | `[{ id, name, at, current, active }]` — `active`: the device has a live session |
 | `POST /v1/account/login { …, scope: "support" }` | a sign-in of the support site: the session reaches only `/v1/support/…` and `/v1/account/logout`, every other request answers `403 session-scope`; no mail access is issued (`mail: null`). An unknown `scope` — `400` |
+| `POST /v1/account/delete { loginHash, code? }` (Bearer, an ordinary session) | the account is deleted at once and for good: `{}`. The password is checked again (`loginHash`) and, with two-step protection on, the code (`401 2fa-required`, `401 bad-2fa`) |
 | `POST /v1/account/devices/:id/revoke { loginHash }` | another device's session is ended: its sessions are deleted, its mail app password is revoked, the device is removed from the list; own device — `400`, unknown device — `404 not-found` |
 | `POST /v1/pair/start` (Bearer) | start a sign-in on another device by QR code: `{ id, expiresAt }`; an exchange lives three minutes, an account has at most three pending ones |
 | `POST /v1/pair/join { id, public, claim, deviceId, deviceName }` | the new device has scanned the code: its one-time public key and the SHA-256 of the secret with which it will collect the result; joining is possible once, otherwise `404 pair-gone` |
@@ -192,6 +193,19 @@ Support settings: `TABORA_SUPPORT_URL` — the address of the support site that 
 tickets and user replies (empty — no such e-mails are sent). The staff list must contain only
 addresses of accounts that already exist: whoever owns the account with such an address becomes
 staff, and a free name from the list could be taken by anyone.
+
+### Deleting an account
+
+`POST /v1/account/delete` deletes the account immediately; there is no waiting period and no way
+back. It needs an ordinary session, the password again and, with two-step protection on, a code
+(an app code or a backup code) — a session of the support site cannot do it. What goes: the
+mailbox on the mail server with all its mail and aliases, then the account's row and everything
+that hangs on it — devices, sessions, keys, sync data, support requests. The mailbox goes first:
+if the mail server cannot delete it now, nothing is deleted and the request can be repeated. The
+name of the account and the addresses of its aliases are moved to the retired names and are never
+given out again: letters meant for the former owner (password resets of other sites among them)
+must not reach another person. If a backup address was set, a letter about the deletion goes to
+it, in the account's language. Tests: `tests/contract.mjs`.
 
 ### Sessions
 
